@@ -3,6 +3,7 @@ package spick
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -13,7 +14,6 @@ import (
 
 var listOpts struct {
 	scope string
-	all   bool
 	json  bool
 }
 
@@ -21,14 +21,15 @@ var listCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List skills",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if listOpts.all {
-			return fmt.Errorf("--all is not supported for list")
+		result, err := appService.List(app.ListOptions{Scope: config.Scope(listOpts.scope), JSON: listOpts.json})
+		if err != nil {
+			return err
 		}
-		result, err := appService.List(app.ListOptions{Scope: config.Scope(listOpts.scope), All: listOpts.all, JSON: listOpts.json})
-		if err != nil { return err }
 		if listOpts.json {
 			data, err := json.MarshalIndent(result, "", "  ")
-			if err != nil { return err }
+			if err != nil {
+				return err
+			}
 			_, err = fmt.Fprintln(cmd.OutOrStdout(), string(data))
 			return err
 		}
@@ -37,21 +38,37 @@ var listCmd = &cobra.Command{
 		}
 		lines := make([]string, 0, len(result.Skills))
 		for _, sk := range result.Skills {
-			lines = append(lines, fmt.Sprintf("%s: %s", sk.ID, skillPath(sk)))
+			lines = append(lines, fmt.Sprintf("%s%s", sk.ID, appliedAgentsBadge(sk)))
 		}
 		_, err = fmt.Fprintln(cmd.OutOrStdout(), strings.Join(lines, "\n"))
 		return err
 	},
 }
 
-func skillPath(sk model.InstalledSkill) string {
-	if sk.Install != nil && sk.Install.CanonicalPath != "" { return sk.Install.CanonicalPath }
-	if sk.Source != nil && sk.Source.Path != "" { return sk.Source.Path }
-	return ""
+func appliedAgentsBadge(sk model.InstalledSkill) string {
+	if len(sk.Exposures) == 0 {
+		return ""
+	}
+	agents := make([]string, 0, len(sk.Exposures))
+	seen := map[string]struct{}{}
+	for _, exposure := range sk.Exposures {
+		if exposure.Agent == "" {
+			continue
+		}
+		if _, ok := seen[exposure.Agent]; ok {
+			continue
+		}
+		seen[exposure.Agent] = struct{}{}
+		agents = append(agents, exposure.Agent)
+	}
+	if len(agents) == 0 {
+		return ""
+	}
+	sort.Strings(agents)
+	return fmt.Sprintf(" [%s]", strings.Join(agents, ", "))
 }
 
 func init() {
 	listCmd.Flags().StringVar(&listOpts.scope, "scope", string(config.ScopeProject), "scope to operate in")
-	listCmd.Flags().BoolVar(&listOpts.all, "all", false, "include all skills")
 	listCmd.Flags().BoolVar(&listOpts.json, "json", false, "emit JSON")
 }

@@ -13,7 +13,7 @@ import (
 
 var rootCmd = &cobra.Command{
 	Use:   "spick",
-	Short: "spick skill picker",
+	Short: "Manage managed-project declarations and enablements",
 }
 
 var appService = app.New(ui.NewPromptTea(), workspace.New(""), skills.New(""))
@@ -26,9 +26,8 @@ func Execute() {
 }
 
 func init() {
-	rootCmd.AddCommand(addCmd)
-	rootCmd.AddCommand(rmCmd)
-	rootCmd.AddCommand(listCmd)
-	rootCmd.AddCommand(inspectCmd)
+	rootCmd.AddCommand(syncCmd)
+	rootCmd.AddCommand(skillCmd)
+	rootCmd.AddCommand(pluginCmd)
 	rootCmd.AddCommand(demoPromptCmd)
 }

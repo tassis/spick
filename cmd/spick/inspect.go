@@ -13,7 +13,6 @@ import (
 var inspectOpts struct {
 	scope  string
 	source string
-	ref    string
 	json   bool
 }
 
@@ -22,7 +21,7 @@ var inspectCmd = &cobra.Command{
 	Short: "Inspect a skill source",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		result, err := appService.Inspect(app.InspectOptions{Scope: config.Scope(inspectOpts.scope), Source: app.SourceFromLocator(args[0]), Ref: inspectOpts.ref, JSON: inspectOpts.json})
+		result, err := appService.Inspect(app.InspectOptions{Scope: config.Scope(inspectOpts.scope), Source: app.SourceFromLocator(args[0]), JSON: inspectOpts.json})
 		if err != nil {
 			return err
 		}
@@ -53,7 +52,6 @@ var inspectCmd = &cobra.Command{
 
 func init() {
 	inspectCmd.Flags().StringVar(&inspectOpts.scope, "scope", string(config.ScopeProject), "scope to operate in")
-	inspectCmd.Flags().StringVar(&inspectOpts.ref, "ref", "", "hosted git ref to inspect")
 	inspectCmd.Flags().BoolVar(&inspectOpts.json, "json", false, "emit JSON")
 	inspectCmd.SetUsageFunc(func(cmd *cobra.Command) error {
 		_, err := fmt.Fprintf(cmd.OutOrStderr(), "Usage:\n  %s <source> [flags]\n", cmd.CommandPath())

@@ -1,0 +1,7 @@
+version: 1
+project:
+  skills: []
+  plugins: []
+  agents: {}
+  exposureMethod: symlink
+  autoApply: true
