@@ -8,7 +8,7 @@ import (
 
 func TestLoadManifest(t *testing.T) {
 	root := t.TempDir()
-	mustWrite(t, filepath.Join(root, "spick.plugin.yaml"), "version: 1\nplugin:\n  id: demo\n  runtime: node\n  entry: index.js\n  name: Demo\n  description: Example\n")
+	mustWrite(t, filepath.Join(root, "spick.res.yaml"), "version: 1\nkind: plugin\nplugin:\n  id: demo\n  runtime: node\n  entry: index.js\n  name: Demo\n  description: Example\n")
 	m, err := LoadManifest(root)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -20,7 +20,7 @@ func TestLoadManifest(t *testing.T) {
 
 func TestLoadManifestRequiresSchemaV1Fields(t *testing.T) {
 	root := t.TempDir()
-	mustWrite(t, filepath.Join(root, "spick.plugin.yaml"), "version: 1\nplugin:\n  id: demo\n  runtime: node\n")
+	mustWrite(t, filepath.Join(root, "spick.res.yaml"), "version: 1\nkind: plugin\nplugin:\n  id: demo\n  runtime: node\n")
 	if _, err := LoadManifest(root); err == nil {
 		t.Fatal("expected required field error")
 	}
@@ -28,7 +28,7 @@ func TestLoadManifestRequiresSchemaV1Fields(t *testing.T) {
 
 func TestLoadManifestRejectsUnsupportedVersion(t *testing.T) {
 	root := t.TempDir()
-	mustWrite(t, filepath.Join(root, "spick.plugin.yaml"), "version: 2\nplugin:\n  id: demo\n  runtime: node\n  entry: index.js\n")
+	mustWrite(t, filepath.Join(root, "spick.res.yaml"), "version: 2\nkind: plugin\nplugin:\n  id: demo\n  runtime: node\n  entry: index.js\n")
 	if _, err := LoadManifest(root); err == nil {
 		t.Fatal("expected version error")
 	}

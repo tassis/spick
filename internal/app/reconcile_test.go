@@ -6,14 +6,13 @@ import (
 
 	"github.com/tassis/spick/internal/lock"
 	"github.com/tassis/spick/internal/model"
-	"github.com/tassis/spick/internal/workspace"
 )
 
 func TestSkillReconcileInputsUseConfigAndLockfile(t *testing.T) {
 	root := t.TempDir()
-	project := &workspace.ProjectConfig{
-		Skills: []model.ProjectSkill{{ID: "declared", Source: "./skill"}},
-		Agents: map[string]model.ProjectAgentEnablement{"opencode": {Skills: []string{"declared"}}},
+	project := &model.ProjectConfig{
+		Skills:   []model.ProjectSkill{{ID: "declared", Source: "./skill"}},
+		Runtimes: map[string]model.ProjectRuntimeEnablement{"opencode": {Skills: []string{"declared"}}},
 	}
 	lockStore := &lock.Store{Root: root}
 	if err := lockStore.UpsertInstalled("project", []model.InstalledSkill{{ID: "materialized", Install: &model.SkillInstall{CanonicalPath: filepath.Join(root, ".spick", "skills", "materialized"), Mode: "symlink"}}}); err != nil {
@@ -30,8 +29,8 @@ func TestSkillReconcileInputsUseConfigAndLockfile(t *testing.T) {
 		t.Fatalf("expected lockfile materialized input, got %+v", inputs.Materialized)
 	}
 	inputs.Enabled["opencode"] = model.ProjectAgentEnablement{Skills: []string{"mutated"}}
-	if project.Agents["opencode"].Skills[0] != "declared" {
-		t.Fatalf("expected config enablement to be cloned, got %+v", project.Agents)
+	if project.Runtimes["opencode"].Skills[0] != "declared" {
+		t.Fatalf("expected config enablement to be cloned, got %+v", project.Runtimes)
 	}
 	actions := planSkillReconcile(inputs)
 	if len(actions) != 2 {
@@ -47,7 +46,7 @@ func TestSkillReconcileInputsUseConfigAndLockfile(t *testing.T) {
 
 func TestPluginReconcileInputsUseConfigAndLockfile(t *testing.T) {
 	root := t.TempDir()
-	project := &workspace.ProjectConfig{Plugins: []model.ProjectPlugin{{ID: "plugin-a", Source: "./plugin"}}, Agents: map[string]model.ProjectAgentEnablement{"opencode": {Plugins: []string{"plugin-a"}}}}
+	project := &model.ProjectConfig{Plugins: []model.ProjectPlugin{{ID: "plugin-a", Source: "./plugin"}}, Runtimes: map[string]model.ProjectRuntimeEnablement{"opencode": {Plugins: []string{"plugin-a"}}}}
 	lockStore := &lock.Store{Root: root}
 	if err := lockStore.UpsertPlugins("project", []model.LockPlugin{{ID: "plugin-b", Materialized: model.LockMaterialized{Path: filepath.Join(root, "plugin-b")}, Projected: model.LockPluginProjected{Path: filepath.Join(root, "plugin-b")}}}); err != nil {
 		t.Fatal(err)
@@ -63,8 +62,8 @@ func TestPluginReconcileInputsUseConfigAndLockfile(t *testing.T) {
 		t.Fatalf("expected lockfile plugin input, got %+v", inputs.Materialized)
 	}
 	inputs.Enabled["opencode"] = model.ProjectAgentEnablement{Plugins: []string{"mutated"}}
-	if project.Agents["opencode"].Plugins[0] != "plugin-a" {
-		t.Fatalf("expected config enablement to be cloned, got %+v", project.Agents)
+	if project.Runtimes["opencode"].Plugins[0] != "plugin-a" {
+		t.Fatalf("expected config enablement to be cloned, got %+v", project.Runtimes)
 	}
 	actions := planPluginReconcile(inputs)
 	if len(actions) != 2 {

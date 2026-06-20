@@ -23,7 +23,7 @@ type ManifestPlugin struct {
 }
 
 func LoadManifest(root string) (*Manifest, error) {
-	data, err := os.ReadFile(filepath.Join(root, "spick.plugin.yaml"))
+	data, err := os.ReadFile(filepath.Join(root, "spick.res.yaml"))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, os.ErrNotExist

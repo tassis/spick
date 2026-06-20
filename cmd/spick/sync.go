@@ -8,7 +8,7 @@ import (
 )
 
 var syncOpts struct {
-	scope  string
+	global bool
 	locked bool
 }
 
@@ -21,10 +21,16 @@ Default sync rebuilds managed state from the current project intent, refreshes t
 lockfile, and reports restored or changed items, items already in sync, and any
 unmanaged plugin material that was found.
 
+Use -g/--global to reconcile the global scope; project sync is the default.
+
 --locked restores strictly from the lockfile snapshot, never rewrites the lockfile,
 and fails if the snapshot is missing or incomplete.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		result, err := appService.Sync(config.Scope(syncOpts.scope), syncOpts.locked)
+		scope := config.ScopeProject
+		if syncOpts.global {
+			scope = config.ScopeGlobal
+		}
+		result, err := appService.Sync(scope, syncOpts.locked)
 		if err != nil {
 			return err
 		}
@@ -42,6 +48,6 @@ and fails if the snapshot is missing or incomplete.`,
 }
 
 func init() {
-	syncCmd.Flags().StringVar(&syncOpts.scope, "scope", string(config.ScopeProject), "scope to operate in")
+	syncCmd.Flags().BoolVarP(&syncOpts.global, "global", "g", false, "reconcile global scope")
 	syncCmd.Flags().BoolVar(&syncOpts.locked, "locked", false, "restore strictly from lockfile snapshot without rewriting it")
 }

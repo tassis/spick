@@ -77,7 +77,7 @@ type AddOptions struct {
 	All            bool
 	Skills         []string
 	Selected       []model.CatalogSkill
-	ExposureMethod string
+	ExposureMethod model.ExposureMethod
 	Agents         []string
 	Agent          string
 	Version        string
@@ -91,7 +91,7 @@ type ApplyOptions struct {
 	Scope          string
 	SourceRoot     string
 	Skills         []model.InstalledSkill
-	ExposureMethod string
+	ExposureMethod model.ExposureMethod
 	Agents         []string
 	Agent          string
 	Force          bool
@@ -120,7 +120,7 @@ type InspectOptions struct {
 func (s *Service) materializeSkill(opts AddOptions, skill model.CatalogSkill) (InstalledSkillResult, error) {
 	mode := opts.ExposureMethod
 	if mode == "" {
-		mode = "symlink"
+		mode = model.DefaultExposureMethod
 	}
 	targetDir, _, err := s.resolvePaths(opts.Scope, opts.Agent, skill.ID)
 	if err != nil {
@@ -138,11 +138,11 @@ func (s *Service) materializeSkill(opts AddOptions, skill model.CatalogSkill) (I
 	if err := copyDir(sourceDir, targetDir); err != nil {
 		return InstalledSkillResult{}, err
 	}
-	if mode != "copy" && mode != "symlink" {
+	if !mode.IsValid() {
 		return InstalledSkillResult{}, fmt.Errorf("unsupported exposure method %q", mode)
 	}
 	if opts.AutoApply != nil && !*opts.AutoApply {
-		return InstalledSkillResult{ID: skill.ID, Path: targetDir, Target: targetDir, Mode: mode, Source: skill.Source}, nil
+		return InstalledSkillResult{ID: skill.ID, Path: targetDir, Target: targetDir, Mode: string(mode), Source: skill.Source}, nil
 	}
 	if len(opts.Agents) == 0 {
 		opts.Agents = []string{defaultAgent(opts.Agent)}
@@ -164,7 +164,7 @@ func (s *Service) materializeSkill(opts AddOptions, skill model.CatalogSkill) (I
 		if err := os.MkdirAll(filepath.Dir(exposurePath), 0o755); err != nil {
 			return InstalledSkillResult{}, err
 		}
-		if mode == "copy" {
+		if mode == model.ExposureMethodCopy {
 			if err := copyDir(targetDir, exposurePath); err != nil {
 				return InstalledSkillResult{}, err
 			}
@@ -179,15 +179,15 @@ func (s *Service) materializeSkill(opts AddOptions, skill model.CatalogSkill) (I
 		}
 		exposures = append(exposures, model.Exposure{Agent: agent, Path: exposurePath})
 	}
-	return InstalledSkillResult{ID: skill.ID, Path: targetDir, Target: targetDir, Mode: mode, Source: skill.Source, Exposures: exposures}, nil
+	return InstalledSkillResult{ID: skill.ID, Path: targetDir, Target: targetDir, Mode: string(mode), Source: skill.Source, Exposures: exposures}, nil
 }
 
 func (s *Service) applySkill(opts ApplyOptions, skill model.InstalledSkill) (InstalledSkillResult, error) {
 	mode := opts.ExposureMethod
 	if mode == "" {
-		mode = "symlink"
+		mode = model.DefaultExposureMethod
 	}
-	if mode != "copy" && mode != "symlink" {
+	if !mode.IsValid() {
 		return InstalledSkillResult{}, fmt.Errorf("unsupported exposure method %q", mode)
 	}
 	if skill.Install == nil || skill.Install.CanonicalPath == "" {
@@ -203,14 +203,14 @@ func (s *Service) applySkill(opts ApplyOptions, skill model.InstalledSkill) (Ins
 	if len(opts.Agents) == 0 {
 		opts.Agents = []string{defaultAgent(opts.Agent)}
 	}
-	existing := map[string]model.Exposure{}
+	existing := model.ExposureByAgent{}
 	for _, exposure := range skill.Exposures {
 		exposure.Path = resolveWorkspacePath(s.WorkspaceRoot, exposure.Path)
 		existing[exposure.Agent] = exposure
 	}
-	desired := map[string]bool{}
+	desired := model.NewStringSet()
 	for _, agent := range opts.Agents {
-		desired[agent] = true
+		desired.Add(agent)
 		if current, ok := existing[agent]; ok {
 			if sameExposure(s.WorkspaceRoot, current.Path, canonical, mode) {
 				continue
@@ -232,7 +232,7 @@ func (s *Service) applySkill(opts ApplyOptions, skill model.InstalledSkill) (Ins
 		existing[agent] = model.Exposure{Agent: agent, Path: exposurePath}
 	}
 	for agent, exposure := range existing {
-		if desired[agent] {
+		if desired.Has(agent) {
 			continue
 		}
 		if err := os.RemoveAll(resolveWorkspacePath(s.WorkspaceRoot, exposure.Path)); err != nil {
@@ -246,10 +246,10 @@ func (s *Service) applySkill(opts ApplyOptions, skill model.InstalledSkill) (Ins
 			exposures = append(exposures, exposure)
 		}
 	}
-	return InstalledSkillResult{ID: skill.ID, Path: canonical, Target: canonical, Mode: mode, Exposures: exposures}, nil
+	return InstalledSkillResult{ID: skill.ID, Path: canonical, Target: canonical, Mode: string(mode), Exposures: exposures}, nil
 }
 
-func sameExposure(workspaceRoot, path, canonical, mode string) bool {
+func sameExposure(workspaceRoot, path, canonical string, mode model.ExposureMethod) bool {
 	if path != "" && !filepath.IsAbs(path) {
 		path = filepath.Join(workspaceRoot, path)
 	}
@@ -257,7 +257,7 @@ func sameExposure(workspaceRoot, path, canonical, mode string) bool {
 	if err != nil {
 		return false
 	}
-	if mode == "copy" {
+	if mode == model.ExposureMethodCopy {
 		return info.IsDir()
 	}
 	if info.Mode()&os.ModeSymlink == 0 {
@@ -274,14 +274,14 @@ func sameExposure(workspaceRoot, path, canonical, mode string) bool {
 	return absTarget == canonical
 }
 
-func materializeExposure(path, canonical, mode string) error {
+func materializeExposure(path, canonical string, mode model.ExposureMethod) error {
 	if err := os.RemoveAll(path); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	if mode == "copy" {
+	if mode == model.ExposureMethodCopy {
 		return copyDir(canonical, path)
 	}
 	rel, err := filepath.Rel(filepath.Dir(path), canonical)

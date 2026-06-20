@@ -30,6 +30,13 @@ func TestLockRoundTrip(t *testing.T) {
 	}
 }
 
+func TestGlobalLockPathUsesSpickRoot(t *testing.T) {
+	s := New(t.TempDir())
+	if got := s.pathFor("global"); got != filepath.Join(userHome(), ".spick", "spick.lock") {
+		t.Fatalf("unexpected global lock path: %s", got)
+	}
+}
+
 func TestLockNormalizesProjectPaths(t *testing.T) {
 	root := t.TempDir()
 	s := New(root)
@@ -96,6 +103,25 @@ func TestLockReadsCanonicalSnapshotLayout(t *testing.T) {
 	}
 	if got.Skills[0].Materialized.Path != ".spick/skills/demo" || len(got.Skills[0].Projected.Exposures) != 1 {
 		t.Fatalf("unexpected installed state: %+v", got.Skills[0].Materialized)
+	}
+}
+
+func TestLockPersistsPolicyAndRuntimes(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	lf := &model.Lockfile{Version: 1, Scope: "project", ExposureMethod: model.ExposureMethodCopy, AutoApply: true, Runtimes: map[string]model.LockRuntimeEntry{"opencode": {Skills: []string{"demo"}, Plugins: []string{"plugin-demo"}, Agents: []string{"opencode"}}}, Agents: []model.LockAgent{{ID: "opencode", Path: filepath.Join(root, ".opencode", "skills", "demo")}}}
+	if err := s.Write("project", lf); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Read("project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ExposureMethod != model.ExposureMethodCopy || !got.AutoApply {
+		t.Fatalf("unexpected policy snapshot: %+v", got)
+	}
+	if len(got.Runtimes) != 1 || len(got.Runtimes["opencode"].Plugins) != 1 {
+		t.Fatalf("unexpected runtime snapshot: %+v", got.Runtimes)
 	}
 }
 

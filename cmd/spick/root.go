@@ -27,7 +27,10 @@ func Execute() {
 
 func init() {
 	rootCmd.AddCommand(syncCmd)
-	rootCmd.AddCommand(skillCmd)
-	rootCmd.AddCommand(pluginCmd)
+	rootCmd.AddCommand(inspectCmd)
+	rootCmd.AddCommand(listCmd)
+	rootCmd.AddCommand(addCmd)
+	rootCmd.AddCommand(rmCmd)
+	rootCmd.AddCommand(applyCmd)
 	rootCmd.AddCommand(demoPromptCmd)
 }

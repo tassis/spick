@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/tassis/spick/internal/app"
-	"github.com/tassis/spick/internal/config"
 	"github.com/tassis/spick/internal/skills"
 	"github.com/tassis/spick/internal/ui"
 	"github.com/tassis/spick/internal/workspace"
@@ -57,7 +56,6 @@ func TestInspectCommandAcceptsInlineRef(t *testing.T) {
 	t.Setenv("SPICK_GIT_BASE_URL", "file://"+base)
 	appService = app.New(ui.NewPromptTea(), workspace.New(t.TempDir()), skills.New(t.TempDir()))
 	inspectOpts.json = false
-	inspectOpts.scope = string(config.ScopeProject)
 	buf := &bytes.Buffer{}
 	inspectCmd.SetOut(buf)
 	if err := inspectCmd.RunE(inspectCmd, []string{"github:owner/repo@main"}); err != nil {
@@ -73,7 +71,6 @@ func TestInspectCommandTreatsLocalAtAsPath(t *testing.T) {
 	writeInspectTestFiles(t, local)
 	appService = app.New(ui.NewPromptTea(), workspace.New(local), skills.New(local))
 	inspectOpts.json = false
-	inspectOpts.scope = string(config.ScopeProject)
 	buf := &bytes.Buffer{}
 	inspectCmd.SetOut(buf)
 	if err := inspectCmd.RunE(inspectCmd, []string{local}); err != nil {
@@ -89,7 +86,6 @@ func TestInspectCommandTreatsLocalAtAsPathRejectedByPathLookup(t *testing.T) {
 	writeInspectTestFiles(t, root)
 	appService = app.New(ui.NewPromptTea(), workspace.New(root), skills.New(root))
 	inspectOpts.json = false
-	inspectOpts.scope = string(config.ScopeProject)
 	buf := &bytes.Buffer{}
 	inspectCmd.SetOut(buf)
 	if err := inspectCmd.RunE(inspectCmd, []string{root + "@main"}); err == nil {
@@ -102,7 +98,7 @@ func writeInspectTestFiles(t *testing.T, root string) {
 	if err := os.MkdirAll(filepath.Dir(filepath.Join(root, "spick.yaml")), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "spick.skill.yaml"), []byte("version: 1\nskills:\n    - id: demo\n      path: .\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "spick.res.yaml"), []byte("version: 1\nkind: resources\nresources:\n  skills:\n    - id: demo\n      path: .\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "SKILL.md"), []byte("# demo\n"), 0o644); err != nil {

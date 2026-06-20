@@ -104,11 +104,14 @@ type AddResult struct {
 	Source   model.Source                  `json:"source"`
 	Catalog  []model.CatalogSkill          `json:"catalog,omitempty"`
 	Selected []model.CatalogSkill          `json:"selected,omitempty"`
+	Agents   []model.AgentResource         `json:"agents,omitempty"`
+	Picked   []model.AgentResource         `json:"picked,omitempty"`
+	Kind     string                        `json:"kind,omitempty"`
 	Message  string                        `json:"message,omitempty"`
 	Added    []skills.InstalledSkillResult `json:"added,omitempty"`
 }
 
-func (a *App) projectHasSkillID(projectConfig *workspace.ProjectConfig, id string) bool {
+func (a *App) projectHasSkillID(projectConfig *model.ProjectConfig, id string) bool {
 	if projectConfig == nil {
 		return false
 	}
@@ -120,7 +123,7 @@ func (a *App) projectHasSkillID(projectConfig *workspace.ProjectConfig, id strin
 	return false
 }
 
-func (a *App) projectHasPluginID(projectConfig *workspace.ProjectConfig, id string) bool {
+func (a *App) projectHasPluginID(projectConfig *model.ProjectConfig, id string) bool {
 	if projectConfig == nil {
 		return false
 	}
@@ -143,76 +146,179 @@ func (a *App) Add(opts AddOptions) (*AddResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	originalSource, openedSource, err := a.resolveAddSource(opts)
+	if err != nil {
+		return nil, err
+	}
+	opts.Source = openedSource
+	if opts.Source.Path == "" {
+		return nil, fmt.Errorf("local source path required")
+	}
+	manifest, err := a.Workspace.LoadResourceManifest()
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	kind, err := a.resolveAddKind(opts, manifest)
+	if err != nil {
+		return nil, err
+	}
+	result := &AddResult{Source: opts.Source, Kind: string(kind)}
+	if kind == model.ResourceKindPlugin {
+		return a.addPlugin(opts, result)
+	}
+	catalog, agents, err := a.loadCatalogAndAgents(opts)
+	if err != nil {
+		return nil, err
+	}
+	if kind == model.ResourceKindAgent {
+		result.Agents = agents
+		if len(agents) == 0 {
+			return nil, fmt.Errorf("no valid agent resource found")
+		}
+		picked, err := selectAgentResources(a.Prompter, result.Agents, opts)
+		if err != nil {
+			return nil, err
+		}
+		result.Picked = picked
+		if len(picked) == 0 {
+			result.Message = "no resources selected"
+			return result, nil
+		}
+		result.Message = "selected agents"
+		return result, nil
+	}
+	if kind == model.ResourceKindResources && len(catalog) == 0 {
+		return nil, fmt.Errorf("no valid skill resource found")
+	}
+	selected, err := selectCatalogSkills(a.Prompter, catalog, opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.applySelectedSkillsToProjectConfig(projectConfig, selected, originalSource, opts.Force); err != nil {
+		return nil, err
+	}
+	a.updateProjectRuntimeAutoApply(projectConfig, selected)
+	if err := a.Workspace.WriteProjectConfig(*projectConfig); err != nil {
+		return nil, err
+	}
+	result.Catalog = catalog
+	result.Selected = selected
+	if err := a.materializeSkills(result, opts, projectConfig, originalSource, selected); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (a *App) resolveAddSource(opts AddOptions) (model.Source, model.Source, error) {
 	rawSource := opts.Source.Locator
 	if rawSource == "" {
 		rawSource = opts.Source.CloneURL
 	}
 	parsed, err := a.Workspace.ParseSource(rawSource)
 	if err != nil {
-		return nil, err
+		return model.Source{}, model.Source{}, err
 	}
 	if err := validateHostedOptions(parsed.Kind, opts); err != nil {
-		return nil, err
+		return model.Source{}, model.Source{}, err
 	}
 	if err := applyRequestedVersion(parsed); err != nil {
-		return nil, err
+		return model.Source{}, model.Source{}, err
 	}
 	opened, err := a.Workspace.OpenSource(parsed.Source)
 	if err != nil {
+		return model.Source{}, model.Source{}, err
+	}
+	return parsed.Source, opened, nil
+}
+
+func (a *App) resolveAddKind(opts AddOptions, manifest *model.ResourceManifest) (model.ResourceKind, error) {
+	kind := opts.ResourceKind
+	if kind == "" {
+		if manifest != nil {
+			kind = manifest.Kind
+		} else {
+			kind = model.ResourceKindResources
+		}
+	}
+	if kind == model.ResourceKindPlugin && manifest == nil {
+		return "", fmt.Errorf("no valid plugin resource found")
+	}
+	return kind, nil
+}
+
+func (a *App) addPlugin(opts AddOptions, result *AddResult) (*AddResult, error) {
+	if result == nil {
+		result = &AddResult{Source: opts.Source}
+	}
+	pluginResult, err := a.AddPlugin(AddPluginOptions{Scope: opts.Scope, Source: opts.Source, Force: opts.Force})
+	if err != nil {
 		return nil, err
 	}
-	originalSource := parsed.Source
-	opts.Source = opened
-	if opts.Source.Path == "" {
-		return nil, fmt.Errorf("local source path required")
+	if pluginResult != nil {
+		result.Source = pluginResult.Source
 	}
+	result.Message = "selected plugin package"
+	return result, nil
+}
+
+func (a *App) loadCatalogAndAgents(opts AddOptions) ([]model.CatalogSkill, []model.AgentResource, error) {
 	catalog, err := a.Workspace.BuildCatalog(opts.Scope, opts.Source)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	selected, err := selectCatalogSkills(a.Prompter, catalog, opts)
+	agentsRaw, err := a.Workspace.DiscoverAgentResources()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	agents := make([]model.AgentResource, 0, len(agentsRaw))
+	for _, ar := range agentsRaw {
+		agents = append(agents, model.AgentResource{ID: ar.ID, Path: ar.Path, Format: ar.Format, Body: ar.Body})
+	}
+	return catalog, agents, nil
+}
+
+func (a *App) applySelectedSkillsToProjectConfig(projectConfig *model.ProjectConfig, selected []model.CatalogSkill, originalSource model.Source, force bool) error {
+	if projectConfig == nil {
+		projectConfig = &model.ProjectConfig{}
 	}
 	for _, skill := range selected {
-		if a.projectHasSkillID(projectConfig, skill.ID) && !opts.Force {
-			return nil, fmt.Errorf("skill %q already declared; use --force to replace", skill.ID)
+		if a.projectHasSkillID(projectConfig, skill.ID) && !force {
+			return fmt.Errorf("skill %q already declared; use --force to replace", skill.ID)
 		}
+		projectConfig.Skills = model.UpsertProjectSkill(append([]model.ProjectSkill(nil), projectConfig.Skills...), model.ProjectSkill{ID: skill.ID, Source: nonEmpty(originalSource.Locator, originalSource.CloneURL, originalSource.Path), Ref: originalSource.RequestedVersion})
 	}
-	declared := append([]model.ProjectSkill(nil), projectConfig.Skills...)
-	for _, skill := range selected {
-		declared = upsertProjectSkill(declared, model.ProjectSkill{ID: skill.ID, Source: nonEmpty(originalSource.Locator, originalSource.CloneURL, originalSource.Path), Ref: originalSource.RequestedVersion})
+	return nil
+}
+
+func (a *App) updateProjectRuntimeAutoApply(projectConfig *model.ProjectConfig, selected []model.CatalogSkill) {
+	if !projectConfig.AutoApply || len(selected) == 0 {
+		return
 	}
-	if err := a.Workspace.WriteProjectSkills(declared); err != nil {
-		return nil, err
-	}
-	if projectConfig.AutoApply && len(selected) > 0 {
-		for agent, enablement := range projectConfig.Agents {
-			ids := append([]string(nil), enablement.Skills...)
-			for _, skill := range selected {
-				if !containsString(ids, skill.ID) {
-					ids = append(ids, skill.ID)
-				}
-			}
-			if err := a.Workspace.WriteProjectAgentEnablement(agent, ids, enablement.Plugins); err != nil {
-				return nil, err
+	for runtime, enablement := range projectConfig.Runtimes {
+		ids := append([]string(nil), enablement.Skills...)
+		for _, skill := range selected {
+			if !containsString(ids, skill.ID) {
+				ids = append(ids, skill.ID)
 			}
 		}
+		projectConfig.Runtimes[runtime] = model.ProjectRuntimeEnablement{Skills: ids, Plugins: append([]string(nil), enablement.Plugins...), Agents: append([]string(nil), enablement.Agents...)}
 	}
-	result := &AddResult{Source: opts.Source, Catalog: catalog, Selected: selected}
+}
+
+func (a *App) materializeSkills(result *AddResult, opts AddOptions, projectConfig *model.ProjectConfig, originalSource model.Source, selected []model.CatalogSkill) error {
 	if len(selected) == 0 {
-		result.Message = "no skills selected"
-		return result, nil
+		result.Message = "no resources selected"
+		return nil
 	}
 	if a.Skills == nil {
 		result.Message = "selected skills"
-		return result, nil
+		return nil
 	}
-	agents := effectiveAgents(opts.Agent, projectConfig.Agents)
+	agents := effectiveAgents(opts.Agent, projectConfig.Runtimes)
 	autoApply := projectConfig.AutoApply
-	added, err := a.Skills.Add(skills.AddOptions{Scope: string(opts.Scope), SourceRoot: opts.Source.Path, All: opts.All, Skills: opts.Skills, Selected: selected, ExposureMethod: nonEmpty(opts.ExposureMethod, projectConfig.ExposureMethod, "symlink"), Agents: agents, Force: opts.Force, AutoApply: &autoApply})
+	added, err := a.Skills.Add(skills.AddOptions{Scope: string(opts.Scope), SourceRoot: opts.Source.Path, All: opts.All, Skills: opts.Skills, Selected: selected, ExposureMethod: effectiveExposureMethod(opts.ExposureMethod, projectConfig.ExposureMethod), Agents: agents, Force: opts.Force, AutoApply: &autoApply})
 	if err != nil {
-		return nil, err
+		return err
 	}
 	result.Added = added.Installed
 	if a.Locks != nil {
@@ -221,13 +327,13 @@ func (a *App) Add(opts AddOptions) (*AddResult, error) {
 			installed = append(installed, model.InstalledSkill{ID: item.ID, Source: mergeSkillSource(&originalSource, item.Source), Install: &model.SkillInstall{Mode: item.Mode, CanonicalPath: item.Target}, Exposures: item.Exposures})
 		}
 		if err := a.Locks.UpsertInstalled(string(opts.Scope), installed); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	if len(added.Installed) > 0 {
 		result.Message = "selected and materialized skills"
 	}
-	return result, nil
+	return nil
 }
 
 func containsString(items []string, target string) bool {
@@ -239,27 +345,17 @@ func containsString(items []string, target string) bool {
 	return false
 }
 
-func upsertProjectSkill(items []model.ProjectSkill, next model.ProjectSkill) []model.ProjectSkill {
-	for i, item := range items {
-		if item.ID == next.ID {
-			items[i] = next
-			return items
-		}
-	}
-	return append(items, next)
-}
-
 func validateAddOptions(opts AddOptions) error {
 	if err := agents.Validate(opts.Agent); err != nil {
 		return err
 	}
-	if opts.ExposureMethod != "" && opts.ExposureMethod != "copy" && opts.ExposureMethod != "symlink" {
+	if opts.ExposureMethod != "" && !opts.ExposureMethod.IsValid() {
 		return fmt.Errorf("unsupported exposure method %q", opts.ExposureMethod)
 	}
 	return nil
 }
 
-func effectiveAgents(explicit string, configured map[string]model.ProjectAgentEnablement) []string {
+func effectiveAgents(explicit string, configured map[string]model.ProjectRuntimeEnablement) []string {
 	if explicit != "" {
 		return []string{explicit}
 	}
@@ -281,8 +377,16 @@ func validateHostedOptions(kind string, opts AddOptions) error {
 }
 
 type ListResult struct {
-	Scope  string                 `json:"scope"`
-	Skills []model.InstalledSkill `json:"skills"`
+	Scope   string                 `json:"scope"`
+	Skills  []model.InstalledSkill `json:"skills,omitempty"`
+	Plugins []PluginListItem       `json:"plugins,omitempty"`
+	Agents  []AgentListItem        `json:"agents,omitempty"`
+}
+
+type AgentListItem struct {
+	ID      string   `json:"id"`
+	Skills  []string `json:"skills,omitempty"`
+	Plugins []string `json:"plugins,omitempty"`
 }
 
 func mergeSkillSource(original, discovered *model.Source) *model.SkillSource {
@@ -312,11 +416,11 @@ func mergeSkillSource(original, discovered *model.Source) *model.SkillSource {
 	return out
 }
 
-func skillReconcileInputs(project *workspace.ProjectConfig, locks *lock.Store, scope string) (*SkillReconcileInputs, error) {
+func skillReconcileInputs(project *model.ProjectConfig, locks *lock.Store, scope string) (*SkillReconcileInputs, error) {
 	inputs := &SkillReconcileInputs{}
 	if project != nil {
 		inputs.Declared = append([]model.ProjectSkill(nil), project.Skills...)
-		inputs.Enabled = cloneProjectAgentEnablement(project.Agents)
+		inputs.Enabled = model.CloneRuntimeEnablement(project.Runtimes)
 	}
 	if locks == nil {
 		return inputs, nil
@@ -332,11 +436,11 @@ func skillReconcileInputs(project *workspace.ProjectConfig, locks *lock.Store, s
 	return inputs, nil
 }
 
-func pluginReconcileInputs(project *workspace.ProjectConfig, locks *lock.Store, scope string) (*PluginReconcileInputs, error) {
+func pluginReconcileInputs(project *model.ProjectConfig, locks *lock.Store, scope string) (*PluginReconcileInputs, error) {
 	inputs := &PluginReconcileInputs{}
 	if project != nil {
 		inputs.Declared = append([]model.ProjectPlugin(nil), project.Plugins...)
-		inputs.Enabled = cloneProjectAgentEnablement(project.Agents)
+		inputs.Enabled = model.CloneRuntimeEnablement(project.Runtimes)
 	}
 	if locks == nil {
 		return inputs, nil
@@ -356,31 +460,19 @@ func planSkillReconcile(inputs *SkillReconcileInputs) []SkillReconcileAction {
 	if inputs == nil {
 		return nil
 	}
-	declared := map[string]model.ProjectSkill{}
-	for _, skill := range inputs.Declared {
-		declared[skill.ID] = skill
-	}
-	materialized := map[string]model.InstalledSkill{}
-	for _, skill := range inputs.Materialized {
-		materialized[skill.ID] = skill
-	}
-	ids := make([]string, 0, len(declared)+len(materialized))
-	seen := map[string]bool{}
+	declared := model.IndexProjectSkills(inputs.Declared)
+	materialized := model.IndexInstalledSkills(inputs.Materialized)
+	ids := model.NewStringSet()
 	for id := range declared {
-		if !seen[id] {
-			seen[id] = true
-			ids = append(ids, id)
-		}
+		ids.Add(id)
 	}
 	for id := range materialized {
-		if !seen[id] {
-			seen[id] = true
-			ids = append(ids, id)
-		}
+		ids.Add(id)
 	}
-	sort.Strings(ids)
-	actions := make([]SkillReconcileAction, 0, len(ids))
-	for _, id := range ids {
+	all := ids.Keys()
+	// sort.Strings already applied by model.StringSet.Keys
+	actions := make([]SkillReconcileAction, 0, len(all))
+	for _, id := range all {
 		action := SkillReconcileAction{ID: id}
 		if decl, ok := declared[id]; ok {
 			action.Declared = &decl
@@ -403,31 +495,19 @@ func planPluginReconcile(inputs *PluginReconcileInputs) []PluginReconcileAction 
 	if inputs == nil {
 		return nil
 	}
-	declared := map[string]model.ProjectPlugin{}
-	for _, plugin := range inputs.Declared {
-		declared[plugin.ID] = plugin
-	}
-	materialized := map[string]model.LockPlugin{}
-	for _, plugin := range inputs.Materialized {
-		materialized[plugin.ID] = plugin
-	}
-	ids := make([]string, 0, len(declared)+len(materialized))
-	seen := map[string]bool{}
+	declared := model.IndexProjectPlugins(inputs.Declared)
+	materialized := model.IndexLockPlugins(inputs.Materialized)
+	ids := model.NewStringSet()
 	for id := range declared {
-		if !seen[id] {
-			seen[id] = true
-			ids = append(ids, id)
-		}
+		ids.Add(id)
 	}
 	for id := range materialized {
-		if !seen[id] {
-			seen[id] = true
-			ids = append(ids, id)
-		}
+		ids.Add(id)
 	}
-	sort.Strings(ids)
-	actions := make([]PluginReconcileAction, 0, len(ids))
-	for _, id := range ids {
+	all := ids.Keys()
+	// sort.Strings already applied by model.StringSet.Keys
+	actions := make([]PluginReconcileAction, 0, len(all))
+	for _, id := range all {
 		action := PluginReconcileAction{ID: id}
 		if decl, ok := declared[id]; ok {
 			action.Declared = &decl
@@ -444,41 +524,46 @@ func (a *App) Sync(scope config.Scope, locked bool) (*SyncResult, error) {
 	if a == nil || a.Workspace == nil || a.Locks == nil || a.Skills == nil {
 		return nil, fmt.Errorf("workspace, skills, and locks are required")
 	}
-	project, err := a.Workspace.LoadProjectConfig()
+	if locked {
+		return a.syncLocked(scope)
+	}
+	project, err := a.Workspace.LoadProjectConfigForScope(scope)
 	if err != nil {
 		return nil, err
-	}
-	if locked {
-		return a.syncLocked(scope, project)
 	}
 	return a.syncUnlocked(scope, project)
 }
 
-func (a *App) syncUnlocked(scope config.Scope, project *workspace.ProjectConfig) (*SyncResult, error) {
+func (a *App) syncUnlocked(scope config.Scope, project *model.ProjectConfig) (*SyncResult, error) {
 	result := &SyncResult{}
 	declaredSkills := append([]model.ProjectSkill(nil), project.Skills...)
 	declaredPlugins := append([]model.ProjectPlugin(nil), project.Plugins...)
+	declaredAgents := make([]model.LockAgent, 0, len(project.Agents))
+	for _, agent := range project.Agents {
+		declaredAgents = append(declaredAgents, model.LockAgent{ID: agent.ID, Path: agent.Path})
+	}
 	openedSkills := map[string]model.Source{}
 	for _, skill := range declaredSkills {
 		opened, err := a.Workspace.OpenSource(model.Source{Locator: skill.Source})
 		if err != nil {
 			return nil, err
 		}
-		opened.Path = resolveWorkspaceSourcePath(a.Workspace.Root, opened.Path)
+		opened.Path = resolveScopePath(a.Workspace.Root, scope, opened.Path)
 		openedSkills[skill.ID] = opened
 	}
 	openedPlugins := map[string]model.Source{}
 	for _, plugin := range declaredPlugins {
-		opened, err := a.Workspace.OpenSource(model.Source{Locator: plugin.Source})
+		opened, err := a.Workspace.OpenSource(model.Source{Locator: plugin.Source, RequestedVersion: plugin.Ref})
 		if err != nil {
 			return nil, err
 		}
-		opened.Path = resolveWorkspaceSourcePath(a.Workspace.Root, opened.Path)
+		opened.Path = resolveScopePath(a.Workspace.Root, scope, opened.Path)
 		if _, err := plugins.LoadManifest(opened.Path); err != nil {
 			return nil, err
 		}
 		openedPlugins[plugin.ID] = opened
 	}
+	installedSkills := make([]model.InstalledSkill, 0, len(declaredSkills))
 	for _, skill := range declaredSkills {
 		opened := openedSkills[skill.ID]
 		catalog, err := a.Workspace.BuildCatalog(scope, opened)
@@ -489,42 +574,33 @@ func (a *App) syncUnlocked(scope config.Scope, project *workspace.ProjectConfig)
 		if err != nil {
 			return nil, err
 		}
-		added, err := a.Skills.Add(skills.AddOptions{Scope: string(scope), SourceRoot: opened.Path, Selected: selected, ExposureMethod: nonEmpty(project.ExposureMethod, "symlink"), Agents: agentsFromEnablement(project.Agents, skill.ID), AutoApply: &project.AutoApply, Force: true})
+		added, err := a.Skills.Add(skills.AddOptions{Scope: string(scope), SourceRoot: opened.Path, Selected: selected, ExposureMethod: effectiveExposureMethod(project.ExposureMethod), Agents: agentsFromEnablement(project.Runtimes, skill.ID), AutoApply: &project.AutoApply, Force: true})
 		if err != nil {
 			return nil, err
 		}
-		installed := make([]model.InstalledSkill, 0, len(added.Installed))
 		for _, item := range added.Installed {
-			installed = append(installed, model.InstalledSkill{ID: item.ID, Source: mergeSkillSource(&model.Source{Locator: skill.Source}, item.Source), Install: &model.SkillInstall{Mode: item.Mode, CanonicalPath: item.Target}, Exposures: item.Exposures})
-		}
-		if err := a.Locks.UpsertInstalled(string(scope), installed); err != nil {
-			return nil, err
+			installedSkills = append(installedSkills, model.InstalledSkill{ID: item.ID, Source: mergeSkillSource(&model.Source{Locator: skill.Source}, item.Source), Install: &model.SkillInstall{Mode: item.Mode, CanonicalPath: item.Target}, Exposures: item.Exposures})
 		}
 		result.SkillMessages = append(result.SkillMessages, fmt.Sprintf("restored skill %s", skill.ID))
 	}
+	lockPlugins := make([]model.LockPlugin, 0, len(declaredPlugins))
 	for _, plugin := range declaredPlugins {
 		opened := openedPlugins[plugin.ID]
 		mat, err := plugins.Materialize(plugins.MaterializeOptions{WorkspaceRoot: a.Workspace.Root, Scope: string(scope), SourceRoot: opened.Path, ID: plugin.ID, Force: true})
 		if err != nil {
 			return nil, err
 		}
-		lockPlugin := model.LockPlugin{ID: plugin.ID, Declared: model.LockDeclared{Source: plugin.Source, Ref: plugin.Ref}, Resolved: model.LockResolved{Source: plugin.Source, Ref: plugin.Ref, Revision: opened.RequestedVersion}, Materialized: model.LockMaterialized{Path: mat.ManagedPath}, Projected: model.LockPluginProjected{Path: mat.RuntimePath}}
-		if err := a.Locks.UpsertPlugins(string(scope), []model.LockPlugin{lockPlugin}); err != nil {
-			return nil, err
-		}
+		lockPlugins = append(lockPlugins, model.LockPlugin{ID: plugin.ID, Declared: model.LockDeclared{Source: plugin.Source, Ref: plugin.Ref}, Resolved: model.LockResolved{Source: plugin.Source, Ref: plugin.Ref, Revision: opened.RequestedVersion}, Materialized: model.LockMaterialized{Path: mat.ManagedPath}, Projected: model.LockPluginProjected{Path: mat.RuntimePath}})
 	}
-	if lf, err := a.Locks.Read(string(scope)); err == nil {
-		for _, sk := range lf.Skills {
-			if !containsSkill(declaredSkills, sk.ID) {
-				_, _ = a.Locks.Remove(string(scope), []string{sk.ID})
-			}
-		}
-		for _, pl := range lf.Plugins {
-			if !containsPlugin(declaredPlugins, pl.ID) {
-				_ = a.Locks.RemovePlugins(string(scope), []string{pl.ID})
-				result.PluginMessages = append(result.PluginMessages, fmt.Sprintf("unmanaged plugin material present: %s", pl.ID))
-			}
-		}
+	lockSnapshot := buildSyncLockSnapshot(string(scope), installedSkills, lockPlugins, declaredAgents)
+	lockSnapshot.ExposureMethod = effectiveExposureMethod(project.ExposureMethod)
+	lockSnapshot.AutoApply = project.AutoApply
+	lockSnapshot.Runtimes = map[string]model.LockRuntimeEntry{}
+	for id, runtime := range project.Runtimes {
+		lockSnapshot.Runtimes[id] = model.LockRuntimeEntry{Skills: append([]string(nil), runtime.Skills...), Plugins: append([]string(nil), runtime.Plugins...), Agents: append([]string(nil), runtime.Agents...)}
+	}
+	if err := a.Locks.Write(string(scope), lockSnapshot); err != nil {
+		return nil, err
 	}
 	if len(result.SkillMessages) == 0 {
 		result.SkillMessages = append(result.SkillMessages, "skills already in sync")
@@ -535,7 +611,44 @@ func (a *App) syncUnlocked(scope config.Scope, project *workspace.ProjectConfig)
 	return result, nil
 }
 
-func (a *App) syncLocked(scope config.Scope, project *workspace.ProjectConfig) (*SyncResult, error) {
+func buildSyncLockSnapshot(scope string, skills []model.InstalledSkill, plugins []model.LockPlugin, agents []model.LockAgent) *model.Lockfile {
+	lf := &model.Lockfile{Version: 1, Scope: scope}
+	for _, skill := range skills {
+		lf.Skills = append(lf.Skills, model.LockSkill{ID: skill.ID, Declared: model.LockDeclared{Source: nonEmpty(skill.Source.Locator, skill.Source.CloneURL, skill.Source.Path), Ref: skill.Source.RequestedVersion}, Resolved: model.LockResolved{Source: nonEmpty(skill.Source.Locator, skill.Source.CloneURL, skill.Source.Path), Ref: skill.Source.RequestedVersion, Revision: skill.Source.RequestedVersion}, Materialized: model.LockMaterialized{Path: skill.Install.CanonicalPath}, Projected: model.LockProjected{Mode: skill.Install.Mode, Exposures: skill.Exposures}})
+	}
+	lf.Plugins = append(lf.Plugins, plugins...)
+	lf.Agents = append(lf.Agents, agents...)
+	return lf
+}
+
+func enabledRuntimeIDs(runtimes map[string]model.ProjectRuntimeEnablement) ([]string, []string) {
+	plugIDs := model.NewStringSet()
+	agentIDs := model.NewStringSet()
+	for _, runtime := range runtimes {
+		for _, id := range runtime.Plugins {
+			plugIDs.Add(id)
+		}
+		for _, id := range runtime.Agents {
+			agentIDs.Add(id)
+		}
+	}
+	plugins := plugIDs.Keys()
+	agents := agentIDs.Keys()
+	return plugins, agents
+}
+
+func resolveScopePath(root string, scope config.Scope, p string) string {
+	if scope == config.ScopeGlobal {
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			home = "."
+		}
+		return resolveWorkspaceSourcePath(filepath.Join(home, ".spick"), p)
+	}
+	return resolveWorkspaceSourcePath(root, p)
+}
+
+func (a *App) syncLocked(scope config.Scope) (*SyncResult, error) {
 	lf, err := a.Locks.Read(string(scope))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -543,34 +656,25 @@ func (a *App) syncLocked(scope config.Scope, project *workspace.ProjectConfig) (
 		}
 		return nil, err
 	}
-	if err := validateLockedSyncInputs(project, lf); err != nil {
-		return nil, err
-	}
 	result := &SyncResult{}
 	warnedSkills := map[string][]string{}
 	warnedPlugins := map[string][]string{}
-	declaredSkills := map[string]struct{}{}
-	for _, s := range project.Skills {
-		declaredSkills[s.ID] = struct{}{}
-	}
-	declaredPlugins := map[string]struct{}{}
-	for _, p := range project.Plugins {
-		declaredPlugins[p.ID] = struct{}{}
-	}
+	runtimeMembers := lf.Runtimes
 	for _, sk := range lf.Skills {
-		if _, ok := declaredSkills[sk.ID]; !ok {
-			continue
-		}
-		if sk.Materialized.Path == "" || sk.Projected.Mode == "" || len(sk.Projected.Exposures) == 0 {
+		if sk.Materialized.Path == "" {
 			return nil, fmt.Errorf("locked sync requires installed materialization for skill %s", sk.ID)
 		}
-		managedSkill := resolveWorkspaceSourcePath(a.Workspace.Root, sk.Materialized.Path)
+		managedSkill := resolveScopePath(a.Workspace.Root, scope, sk.Materialized.Path)
 		if _, err := os.Stat(managedSkill); os.IsNotExist(err) {
-			opened, err := a.Workspace.OpenSource(model.Source{Locator: sk.Declared.Source})
+			restoreSource := model.Source{Locator: sk.Resolved.Source, RequestedVersion: sk.Resolved.Ref}
+			if restoreSource.Locator == "" {
+				restoreSource = model.Source{Locator: sk.Declared.Source, RequestedVersion: sk.Declared.Ref}
+			}
+			opened, err := a.Workspace.OpenSource(restoreSource)
 			if err != nil {
 				return nil, fmt.Errorf("locked sync source fetch failed for skill %s: %w", sk.ID, err)
 			}
-			opened.Path = resolveWorkspaceSourcePath(a.Workspace.Root, opened.Path)
+			opened.Path = resolveScopePath(a.Workspace.Root, scope, opened.Path)
 			catalog, err := a.Workspace.BuildCatalog(scope, opened)
 			if err != nil {
 				return nil, fmt.Errorf("locked sync source fetch failed for skill %s: %w", sk.ID, err)
@@ -579,7 +683,8 @@ func (a *App) syncLocked(scope config.Scope, project *workspace.ProjectConfig) (
 			if err != nil {
 				return nil, fmt.Errorf("locked sync source fetch failed for skill %s: %w", sk.ID, err)
 			}
-			added, err := a.Skills.Add(skills.AddOptions{Scope: string(scope), SourceRoot: opened.Path, Selected: selected, ExposureMethod: sk.Projected.Mode, Agents: agentsFromLockedExposures(sk.Projected.Exposures), Force: true})
+			exposureMethod := effectiveExposureMethod(lf.ExposureMethod)
+			added, err := a.Skills.Add(skills.AddOptions{Scope: string(scope), SourceRoot: opened.Path, Selected: selected, ExposureMethod: exposureMethod, Agents: agentsFromLockRuntimeMembership(runtimeMembers, sk.ID), Force: true})
 			if err != nil {
 				return nil, fmt.Errorf("locked sync source fetch failed for skill %s: %w", sk.ID, err)
 			}
@@ -587,12 +692,12 @@ func (a *App) syncLocked(scope config.Scope, project *workspace.ProjectConfig) (
 				return nil, fmt.Errorf("locked sync snapshot insufficiency for skill %s", sk.ID)
 			}
 			managedSkill = added.Installed[0].Target
-			if isUnpinnedSource(sk.Declared.Source, sk.Declared.Ref) {
-				warnedSkills[sk.Declared.Source] = append(warnedSkills[sk.Declared.Source], sk.ID)
+			if isUnpinnedSource(restoreSource.Locator, restoreSource.RequestedVersion) {
+				warnedSkills[restoreSource.Locator] = append(warnedSkills[restoreSource.Locator], sk.ID)
 			}
 		}
-		for _, ex := range sk.Projected.Exposures {
-			path := resolveWorkspaceSourcePath(a.Workspace.Root, ex.Path)
+		for _, ex := range skillExposurePaths(scope, lf, sk.ID) {
+			path := resolveScopePath(a.Workspace.Root, scope, ex.Path)
 			if err := os.RemoveAll(path); err != nil {
 				return nil, err
 			}
@@ -610,29 +715,30 @@ func (a *App) syncLocked(scope config.Scope, project *workspace.ProjectConfig) (
 		result.SkillMessages = append(result.SkillMessages, fmt.Sprintf("restored skill %s", sk.ID))
 	}
 	for _, pl := range lf.Plugins {
-		if _, ok := declaredPlugins[pl.ID]; !ok {
-			continue
-		}
-		if pl.Materialized.Path == "" || pl.Projected.Path == "" {
+		if pl.Materialized.Path == "" {
 			return nil, fmt.Errorf("locked sync snapshot insufficiency for plugin %s", pl.ID)
 		}
-		managedPlugin := resolveWorkspaceSourcePath(a.Workspace.Root, pl.Materialized.Path)
+		managedPlugin := resolveScopePath(a.Workspace.Root, scope, pl.Materialized.Path)
 		if _, err := os.Stat(managedPlugin); os.IsNotExist(err) {
-			opened, err := a.Workspace.OpenSource(model.Source{Locator: pl.Declared.Source})
+			restoreSource := model.Source{Locator: pl.Resolved.Source, RequestedVersion: pl.Resolved.Ref}
+			if restoreSource.Locator == "" {
+				restoreSource = model.Source{Locator: pl.Declared.Source, RequestedVersion: pl.Declared.Ref}
+			}
+			opened, err := a.Workspace.OpenSource(restoreSource)
 			if err != nil {
 				return nil, fmt.Errorf("locked sync source fetch failed for plugin %s: %w", pl.ID, err)
 			}
-			opened.Path = resolveWorkspaceSourcePath(a.Workspace.Root, opened.Path)
+			opened.Path = resolveScopePath(a.Workspace.Root, scope, opened.Path)
 			mat, err := plugins.Materialize(plugins.MaterializeOptions{WorkspaceRoot: a.Workspace.Root, Scope: string(scope), SourceRoot: opened.Path, ID: pl.ID, Force: true})
 			if err != nil {
 				return nil, fmt.Errorf("locked sync source fetch failed for plugin %s: %w", pl.ID, err)
 			}
 			managedPlugin = mat.ManagedPath
-			if isUnpinnedSource(pl.Declared.Source, pl.Declared.Ref) {
-				warnedPlugins[pl.Declared.Source] = append(warnedPlugins[pl.Declared.Source], pl.ID)
+			if isUnpinnedSource(restoreSource.Locator, restoreSource.RequestedVersion) {
+				warnedPlugins[restoreSource.Locator] = append(warnedPlugins[restoreSource.Locator], pl.ID)
 			}
 		}
-		proj := resolveWorkspaceSourcePath(a.Workspace.Root, pl.Projected.Path)
+		proj := resolveScopePath(a.Workspace.Root, scope, pl.Materialized.Path)
 		if proj != managedPlugin {
 			if err := os.RemoveAll(proj); err != nil {
 				return nil, err
@@ -667,6 +773,38 @@ func (a *App) syncLocked(scope config.Scope, project *workspace.ProjectConfig) (
 		result.PluginMessages = append(result.PluginMessages, "plugins already in sync")
 	}
 	return result, nil
+}
+
+func skillExposurePaths(scope config.Scope, lf *model.Lockfile, skillID string) []model.Exposure {
+	paths := []model.Exposure{}
+	seen := model.NewStringSet()
+	for runtimeID, entry := range lf.Runtimes {
+		if !containsString(entry.Skills, skillID) {
+			continue
+		}
+		root, err := agents.ExposureRoot(scope, runtimeID)
+		if err != nil {
+			continue
+		}
+		p := filepath.Join(root, "skills", skillID)
+		if seen.Has(p) {
+			continue
+		}
+		seen.Add(p)
+		paths = append(paths, model.Exposure{Agent: runtimeID, Path: p})
+	}
+	return paths
+}
+
+func agentsFromLockRuntimeMembership(runtimes map[string]model.LockRuntimeEntry, skillID string) []string {
+	out := []string{}
+	for agent, entry := range runtimes {
+		if containsString(entry.Skills, skillID) {
+			out = append(out, agent)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func containsSkill(skills []model.ProjectSkill, id string) bool {
@@ -715,7 +853,7 @@ func resolveWorkspaceSourcePath(root, p string) string {
 	}
 	return filepath.Join(root, p)
 }
-func agentsFromEnablement(enabled map[string]model.ProjectAgentEnablement, id string) []string {
+func agentsFromEnablement(enabled map[string]model.ProjectRuntimeEnablement, id string) []string {
 	var out []string
 	for agent, entry := range enabled {
 		if containsString(entry.Skills, id) {
@@ -729,70 +867,7 @@ func agentsFromEnablement(enabled map[string]model.ProjectAgentEnablement, id st
 	return out
 }
 
-func cloneProjectAgentEnablement(in map[string]model.ProjectAgentEnablement) map[string]model.ProjectAgentEnablement {
-	if len(in) == 0 {
-		return map[string]model.ProjectAgentEnablement{}
-	}
-	out := make(map[string]model.ProjectAgentEnablement, len(in))
-	for k, v := range in {
-		out[k] = model.ProjectAgentEnablement{Skills: append([]string(nil), v.Skills...), Plugins: append([]string(nil), v.Plugins...)}
-	}
-	return out
-}
-
-func validateLockedSyncInputs(project *workspace.ProjectConfig, lf *model.Lockfile) error {
-	if lf == nil {
-		return fmt.Errorf("locked sync requires an existing lockfile")
-	}
-	declaredSkills := map[string]model.ProjectSkill{}
-	for _, skill := range project.Skills {
-		declaredSkills[skill.ID] = skill
-	}
-	lockedSkills := map[string]model.LockSkill{}
-	for _, skill := range lf.Skills {
-		lockedSkills[skill.ID] = skill
-	}
-	for id, decl := range declaredSkills {
-		locked, ok := lockedSkills[id]
-		if !ok {
-			return fmt.Errorf("locked sync requires matching lock entry for skill %s", id)
-		}
-		if decl.Source == "" || locked.Declared.Source == "" {
-			return fmt.Errorf("locked sync requires declared lock info for skill %s", id)
-		}
-		if decl.Ref != "" && locked.Declared.Ref != "" && decl.Ref != locked.Declared.Ref {
-			return fmt.Errorf("locked sync requires config/lock match for skill %s", id)
-		}
-	}
-	for id := range lockedSkills {
-		if _, ok := declaredSkills[id]; !ok {
-			return fmt.Errorf("locked sync requires config/lock match for skill %s", id)
-		}
-	}
-	declaredPlugins := map[string]model.ProjectPlugin{}
-	for _, plugin := range project.Plugins {
-		declaredPlugins[plugin.ID] = plugin
-	}
-	lockedPlugins := map[string]model.LockPlugin{}
-	for _, plugin := range lf.Plugins {
-		lockedPlugins[plugin.ID] = plugin
-	}
-	for id, decl := range declaredPlugins {
-		locked, ok := lockedPlugins[id]
-		if !ok {
-			return fmt.Errorf("locked sync requires matching lock entry for plugin %s", id)
-		}
-		if decl.Source == "" || locked.Declared.Source == "" || locked.Materialized.Path == "" || locked.Projected.Path == "" {
-			return fmt.Errorf("locked sync requires snapshot lock info for plugin %s", id)
-		}
-	}
-	for id := range lockedPlugins {
-		if _, ok := declaredPlugins[id]; !ok {
-			return fmt.Errorf("locked sync requires config/lock match for plugin %s", id)
-		}
-	}
-	return nil
-}
+// validateLockedSyncInputs removed: locked sync is snapshot-authoritative.
 
 func validateLockedMaterialization(inputs *SkillReconcileInputs, lf *model.Lockfile) error {
 	if inputs == nil || lf == nil {
@@ -817,7 +892,20 @@ func (a *App) List(opts ListOptions) (*ListResult, error) {
 		}
 		return nil, err
 	}
-	return &ListResult{Scope: string(opts.Scope), Skills: items}, nil
+	result := &ListResult{Scope: string(opts.Scope), Skills: items}
+	project, err := a.Workspace.LoadProjectConfig()
+	if err != nil {
+		return nil, err
+	}
+	if project != nil {
+		pluginResult, err := a.ListPlugins(opts)
+		if err != nil {
+			return nil, err
+		}
+		result.Plugins = append(result.Plugins, pluginResult.Plugins...)
+		result.Agents = append(result.Agents, listProjectAgents(project)...)
+	}
+	return result, nil
 }
 
 type RemoveResult struct {
@@ -848,12 +936,159 @@ type RemovePluginOptions struct {
 	IDs   []string
 }
 
+type RemoveSelectionMode string
+
+const (
+	RemoveSelectionModeAuto   RemoveSelectionMode = ""
+	RemoveSelectionModeSkill  RemoveSelectionMode = "skill"
+	RemoveSelectionModePlugin RemoveSelectionMode = "plugin"
+)
+
+type RemoveSelectionOptions struct {
+	Scope config.Scope
+	Mode  RemoveSelectionMode
+}
+
+type RemoveSelection struct {
+	Skills  []string
+	Plugins []string
+}
+
+func (a *App) SelectRemovals(opts RemoveSelectionOptions) (*RemoveSelection, error) {
+	if a == nil {
+		return nil, fmt.Errorf("app is required")
+	}
+	listed, err := a.List(ListOptions{Scope: opts.Scope})
+	if err != nil {
+		return nil, err
+	}
+	mode := string(opts.Mode)
+	if mode != string(RemoveSelectionModeAuto) && mode != string(RemoveSelectionModeSkill) && mode != string(RemoveSelectionModePlugin) {
+		return nil, fmt.Errorf("invalid remove mode: %q", opts.Mode)
+	}
+	if mode == string(RemoveSelectionModeSkill) {
+		skills, err := selectRemoveSkillIDs(listed.Skills, a.Prompter)
+		if err != nil {
+			return nil, err
+		}
+		return &RemoveSelection{Skills: skills}, nil
+	}
+	if mode == string(RemoveSelectionModePlugin) {
+		plugins, err := selectRemovePluginIDs(listed.Plugins, a.Prompter)
+		if err != nil {
+			return nil, err
+		}
+		return &RemoveSelection{Plugins: plugins}, nil
+	}
+	if len(listed.Skills) == 0 && len(listed.Plugins) == 0 {
+		return nil, fmt.Errorf("no removable resource found")
+	}
+	if len(listed.Plugins) == 0 {
+		skills, err := selectRemoveSkillIDs(listed.Skills, a.Prompter)
+		if err != nil {
+			return nil, err
+		}
+		return &RemoveSelection{Skills: skills}, nil
+	}
+	if len(listed.Skills) == 0 {
+		plugins, err := selectRemovePluginIDs(listed.Plugins, a.Prompter)
+		if err != nil {
+			return nil, err
+		}
+		return &RemoveSelection{Plugins: plugins}, nil
+	}
+	options := make([]ui.Option, 0, len(listed.Skills)+len(listed.Plugins))
+	labels := make([]string, 0, len(options))
+	for _, skill := range listed.Skills {
+		options = append(options, ui.Option{Label: "skill: " + skill.ID})
+		labels = append(labels, "skill:"+skill.ID)
+	}
+	for _, plugin := range listed.Plugins {
+		options = append(options, ui.Option{Label: "plugin: " + plugin.ID})
+		labels = append(labels, "plugin:"+plugin.ID)
+	}
+	if a.Prompter == nil {
+		return nil, fmt.Errorf("no removable resource found")
+	}
+	indexes, err := a.Prompter.MultiSelect("Remove resources", options, nil)
+	if err != nil {
+		return nil, err
+	}
+	var selectedSkills, selectedPlugins []string
+	for _, idx := range indexes {
+		if idx < 0 || idx >= len(labels) {
+			continue
+		}
+		if strings.HasPrefix(labels[idx], "skill:") {
+			selectedSkills = append(selectedSkills, strings.TrimPrefix(labels[idx], "skill:"))
+		}
+		if strings.HasPrefix(labels[idx], "plugin:") {
+			selectedPlugins = append(selectedPlugins, strings.TrimPrefix(labels[idx], "plugin:"))
+		}
+	}
+	return &RemoveSelection{Skills: selectedSkills, Plugins: selectedPlugins}, nil
+}
+
+func selectRemoveSkillIDs(items []model.InstalledSkill, p ui.Prompter) ([]string, error) {
+	if len(items) == 0 {
+		return nil, fmt.Errorf("no valid skill resource found")
+	}
+	if len(items) == 1 || p == nil {
+		return []string{items[0].ID}, nil
+	}
+	options := make([]ui.Option, 0, len(items))
+	for _, it := range items {
+		options = append(options, ui.Option{Label: it.ID})
+	}
+	indexes, err := p.MultiSelect("Remove skills", options, nil)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(indexes))
+	for _, idx := range indexes {
+		if idx >= 0 && idx < len(items) {
+			ids = append(ids, items[idx].ID)
+		}
+	}
+	return ids, nil
+}
+
+func selectRemovePluginIDs(items []PluginListItem, p ui.Prompter) ([]string, error) {
+	if len(items) == 0 {
+		return nil, fmt.Errorf("no valid plugin resource found")
+	}
+	if len(items) == 1 || p == nil {
+		return []string{items[0].ID}, nil
+	}
+	options := make([]ui.Option, 0, len(items))
+	for _, it := range items {
+		options = append(options, ui.Option{Label: it.ID})
+	}
+	indexes, err := p.MultiSelect("Remove plugins", options, nil)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(indexes))
+	for _, idx := range indexes {
+		if idx >= 0 && idx < len(items) {
+			ids = append(ids, items[idx].ID)
+		}
+	}
+	return ids, nil
+}
+
 func (a *App) Remove(opts RemoveOptions) (*RemoveResult, error) {
 	if a == nil || a.Locks == nil {
 		return &RemoveResult{Message: "no lock store"}, nil
 	}
 	if a.Workspace != nil {
-		if err := a.Workspace.RemoveProjectSkills(opts.Skills); err != nil {
+		projectConfig, err := a.Workspace.LoadProjectConfig()
+		if err != nil {
+			return nil, err
+		}
+		projectConfig.Skills = model.WithoutProjectSkillIDs(projectConfig.Skills, opts.Skills)
+		projectConfig.Runtimes = model.RemoveIDsFromRuntimeEnablements(projectConfig.Runtimes, opts.Skills, nil)
+		if err := a.Workspace.WriteProjectConfig(*projectConfig); err != nil {
 			return nil, err
 		}
 	}
@@ -861,6 +1096,28 @@ func (a *App) Remove(opts RemoveOptions) (*RemoveResult, error) {
 		return nil, err
 	}
 	return &RemoveResult{Removed: opts.Skills, Purged: opts.Skills, Message: "removed skills from canonical storage and exposures"}, nil
+}
+
+func listProjectPlugins(project *model.ProjectConfig) []PluginListItem {
+	if project == nil {
+		return nil
+	}
+	items := make([]PluginListItem, 0, len(project.Plugins))
+	for _, decl := range project.Plugins {
+		items = append(items, PluginListItem{ID: decl.ID, Declared: &decl, State: "declared"})
+	}
+	return items
+}
+
+func listProjectAgents(project *model.ProjectConfig) []AgentListItem {
+	if project == nil || len(project.Agents) == 0 {
+		return nil
+	}
+	out := make([]AgentListItem, 0, len(project.Agents))
+	for _, agent := range project.Agents {
+		out = append(out, AgentListItem{ID: agent.ID})
+	}
+	return out
 }
 
 func (a *App) ListPlugins(opts ListOptions) (*PluginListResult, error) {
@@ -925,17 +1182,6 @@ func (a *App) ListPlugins(opts ListOptions) (*PluginListResult, error) {
 			item.State = "missing"
 			item.Drift = true
 			item.Warning = "not installed"
-		}
-		if item.Installed != nil && item.Installed.Projected.Path != "" {
-			checkPath := item.Installed.Projected.Path
-			if a.Workspace != nil && !strings.HasPrefix(checkPath, string(os.PathSeparator)) {
-				checkPath = filepath.Join(a.Workspace.Root, checkPath)
-			}
-			if _, err := os.Stat(checkPath); os.IsNotExist(err) {
-				item.State = "missing"
-				item.Drift = true
-				item.Warning = "managed runtime material is missing"
-			}
 		}
 		out = append(out, item)
 		seenSources[decl.Source] = true
@@ -1025,7 +1271,13 @@ func (a *App) RemovePlugin(opts RemovePluginOptions) (*RemoveResult, error) {
 			}
 		}
 	}
-	if err := a.Workspace.RemoveProjectPlugins(projectIDs); err != nil {
+	project, err := a.Workspace.LoadProjectConfig()
+	if err != nil {
+		return nil, err
+	}
+	project.Plugins = model.WithoutProjectPluginIDs(project.Plugins, projectIDs)
+	project.Runtimes = model.RemoveIDsFromRuntimeEnablements(project.Runtimes, nil, projectIDs)
+	if err := a.Workspace.WriteProjectConfig(*project); err != nil {
 		return nil, err
 	}
 	if err := a.Locks.RemovePlugins(string(opts.Scope), lockIDs); err != nil {
@@ -1037,6 +1289,7 @@ func (a *App) RemovePlugin(opts RemovePluginOptions) (*RemoveResult, error) {
 type InspectResult struct {
 	Source  model.Source         `json:"source"`
 	Skills  []model.CatalogSkill `json:"skills"`
+	Kind    string               `json:"kind,omitempty"`
 	Message string               `json:"message,omitempty"`
 }
 
@@ -1066,11 +1319,21 @@ func (a *App) Inspect(opts InspectOptions) (*InspectResult, error) {
 	if opts.Source.Path == "" {
 		return nil, fmt.Errorf("local source path required")
 	}
-	skills, err := a.Workspace.BuildCatalog(opts.Scope, opts.Source)
-	if err != nil {
+	loader := &workspace.Loader{Root: opts.Source.Path}
+	if _, err := loader.LoadResourceCatalogManifest(); err == nil {
+		skills, err := loader.LoadCatalog()
+		if err != nil {
+			return nil, err
+		}
+		return &InspectResult{Source: opts.Source, Skills: skills, Kind: "manifest"}, nil
+	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
-	return &InspectResult{Source: opts.Source, Skills: skills}, nil
+	skills, err := loader.DiscoverCatalog()
+	if err != nil {
+		return nil, fmt.Errorf("no spick.res.yaml found and no exported resources discovered; plugin repos require an explicit spick.res.yaml with kind: plugin")
+	}
+	return &InspectResult{Source: opts.Source, Skills: skills, Kind: "resources"}, nil
 }
 
 func (a *App) InspectPlugin(opts PluginInspectOptions) (*PluginSourceResult, error) {
@@ -1108,19 +1371,9 @@ func (a *App) AddPlugin(opts AddPluginOptions) (*PluginSourceResult, error) {
 	if a.projectHasPluginID(project, manifest.Plugin.ID) && !opts.Force {
 		return nil, fmt.Errorf("plugin %q already declared; use --force to replace", manifest.Plugin.ID)
 	}
-	declared := append([]model.ProjectPlugin(nil), project.Plugins...)
-	declared = upsertProjectPlugin(declared, model.ProjectPlugin{ID: manifest.Plugin.ID, Source: nonEmpty(opts.Source.Locator, opts.Source.CloneURL, opened.Locator, opened.CloneURL), Ref: opts.Source.RequestedVersion})
-	if err := a.Workspace.WriteProjectPlugins(declared); err != nil {
+	project.Plugins = model.UpsertProjectPlugin(append([]model.ProjectPlugin(nil), project.Plugins...), model.ProjectPlugin{ID: manifest.Plugin.ID, Source: nonEmpty(opened.Locator, opened.CloneURL, opts.Source.Locator, opts.Source.CloneURL), Ref: opened.RequestedVersion})
+	if err := a.Workspace.WriteProjectConfig(*project); err != nil {
 		return nil, err
-	}
-	if enablement, ok := project.Agents["opencode"]; ok {
-		ids := append([]string(nil), enablement.Plugins...)
-		if !containsString(ids, manifest.Plugin.ID) {
-			ids = append(ids, manifest.Plugin.ID)
-		}
-		if err := a.Workspace.WriteProjectAgentEnablement("opencode", enablement.Skills, ids); err != nil {
-			return nil, err
-		}
 	}
 	if a.Locks != nil && a.Skills != nil {
 		if _, err := a.Sync(opts.Scope, false); err != nil {
@@ -1153,16 +1406,6 @@ func resolvePluginSource(w *workspace.Workspace, source model.Source) (*workspac
 	return parsed, opened, nil
 }
 
-func upsertProjectPlugin(items []model.ProjectPlugin, next model.ProjectPlugin) []model.ProjectPlugin {
-	for i, item := range items {
-		if item.ID == next.ID {
-			items[i] = next
-			return items
-		}
-	}
-	return append(items, next)
-}
-
 func nonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if v != "" {
@@ -1172,8 +1415,32 @@ func nonEmpty(vals ...string) string {
 	return ""
 }
 
+func effectiveExposureMethod(methods ...model.ExposureMethod) model.ExposureMethod {
+	for _, method := range methods {
+		if method != "" {
+			return method
+		}
+	}
+	return model.DefaultExposureMethod
+}
+
 type ApplyResult struct {
 	Applied []skills.InstalledSkillResult `json:"applied,omitempty"`
+}
+
+type ApplyOptions struct {
+	Scope     config.Scope
+	Skills    []string
+	Plugins   []string
+	Agents    []string
+	Agent     string
+	Global    bool
+	Runtime   string
+	Skill     bool
+	Plugin    bool
+	AgentMode bool
+	Force     bool
+	JSON      bool
 }
 
 func (a *App) Apply(opts ApplyOptions) (*ApplyResult, error) {
@@ -1183,105 +1450,214 @@ func (a *App) Apply(opts ApplyOptions) (*ApplyResult, error) {
 	if err := agents.Validate(opts.Agent); err != nil {
 		return nil, err
 	}
-	projectConfig, err := a.Workspace.LoadProjectConfig()
+	selectedScope := opts.Scope
+	if opts.Global {
+		selectedScope = config.ScopeGlobal
+	}
+	if selectedScope == "" {
+		selectedScope = config.ScopeProject
+	}
+	projectConfig, err := a.Workspace.LoadProjectConfigForScope(selectedScope)
 	if err != nil {
 		return nil, err
 	}
-	items, err := a.Locks.List(string(opts.Scope))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return &ApplyResult{}, nil
-		}
-		return nil, err
+	if len(opts.Agents) == 0 && opts.Agent != "" {
+		opts.Agents = []string{opts.Agent}
 	}
-	declaredSkills := map[string]model.ProjectSkill{}
-	declaredOrder := make([]string, 0, len(projectConfig.Skills))
+	declaredSkillIDs := model.NewStringSet()
 	for _, skill := range projectConfig.Skills {
-		declaredSkills[skill.ID] = skill
-		declaredOrder = append(declaredOrder, skill.ID)
+		declaredSkillIDs.Add(skill.ID)
 	}
-	selectedIDs := append([]string(nil), opts.Skills...)
-	if len(selectedIDs) == 0 {
-		selectedIDs = declaredOrder
+	declaredPluginIDs := model.NewStringSet()
+	for _, plugin := range projectConfig.Plugins {
+		declaredPluginIDs.Add(plugin.ID)
 	}
-	for _, id := range selectedIDs {
-		if _, ok := declaredSkills[id]; !ok {
-			return nil, fmt.Errorf("unknown declared skill ids: %s", id)
-		}
+	declaredAgentIDs := model.NewStringSet()
+	for _, agent := range projectConfig.Agents {
+		declaredAgentIDs.Add(agent.ID)
 	}
-	selected, err := selectInstalledSkills(items, selectedIDs)
-	if err != nil {
-		return nil, err
-	}
-	if len(selected) == 0 {
-		return &ApplyResult{}, nil
-	}
-	agentsList := effectiveAgents(opts.Agent, projectConfig.Agents)
-	if len(opts.Agents) > 0 {
-		agentsList = append([]string(nil), opts.Agents...)
-	}
-	if len(agentsList) == 0 {
-		agentsList = []string{"opencode"}
-	}
-	for _, agent := range agentsList {
-		enablement := projectConfig.Agents[agent]
-		ids := append([]string(nil), enablement.Skills...)
-		for _, skill := range selected {
-			if !containsString(ids, skill.ID) {
-				ids = append(ids, skill.ID)
+	if len(opts.Skills) > 0 {
+		for _, id := range opts.Skills {
+			if !declaredSkillIDs.Has(id) {
+				return nil, fmt.Errorf("unknown declared skill ids: %s", id)
 			}
 		}
-		if err := a.Workspace.WriteProjectAgentEnablement(agent, ids, enablement.Plugins); err != nil {
-			return nil, err
+	}
+	if len(opts.Plugins) > 0 {
+		for _, id := range opts.Plugins {
+			if !declaredPluginIDs.Has(id) {
+				return nil, fmt.Errorf("unknown declared plugin ids: %s", id)
+			}
 		}
 	}
-	exposureMethod := opts.ExposureMethod
-	if exposureMethod == "" {
-		exposureMethod = projectConfig.ExposureMethod
+	if opts.Runtime != "" {
+		if _, ok := projectConfig.Runtimes[opts.Runtime]; !ok {
+			return nil, fmt.Errorf("unknown runtime ids: %s", opts.Runtime)
+		}
 	}
-	if exposureMethod == "" {
-		exposureMethod = "symlink"
+	if len(opts.Agents) > 0 {
+		for _, id := range opts.Agents {
+			if !declaredAgentIDs.Has(id) {
+				return nil, fmt.Errorf("apply --agent may only target declared agents: %s", id)
+			}
+		}
 	}
-	applied, err := a.Skills.Apply(skills.ApplyOptions{Scope: string(opts.Scope), Skills: selected, ExposureMethod: exposureMethod, Agents: agentsList, Agent: opts.Agent, Force: opts.Force})
+	runtimeID, err := resolveApplyRuntime(a.Prompter, projectConfig, opts.Runtime)
 	if err != nil {
 		return nil, err
 	}
-	installed := make([]model.InstalledSkill, 0, len(applied.Applied))
-	selectedByID := make(map[string]model.InstalledSkill, len(selected))
-	for _, item := range selected {
-		selectedByID[item.ID] = item
-	}
-	for _, item := range applied.Applied {
-		existing := selectedByID[item.ID]
-		install := existing.Install
-		if install == nil {
-			install = &model.SkillInstall{}
-		}
-		installed = append(installed, model.InstalledSkill{ID: item.ID, Source: existing.Source, Install: &model.SkillInstall{Mode: item.Mode, CanonicalPath: install.CanonicalPath}, Exposures: item.Exposures})
-	}
-	if err := a.Locks.UpsertInstalled(string(opts.Scope), installed); err != nil {
+	if err := a.writeApplyDesiredState(selectedScope, projectConfig, runtimeID, opts); err != nil {
 		return nil, err
 	}
-	return &ApplyResult{Applied: applied.Applied}, nil
+	if _, err := a.Sync(selectedScope, false); err != nil {
+		return nil, err
+	}
+	return &ApplyResult{}, nil
+}
+
+func resolveApplyRuntime(p ui.Prompter, projectConfig *model.ProjectConfig, explicit string) (string, error) {
+	if explicit != "" {
+		if projectConfig == nil || projectConfig.Runtimes == nil {
+			return "", fmt.Errorf("unknown runtime ids: %s", explicit)
+		}
+		if _, ok := projectConfig.Runtimes[explicit]; !ok {
+			return "", fmt.Errorf("unknown runtime ids: %s", explicit)
+		}
+		return explicit, nil
+	}
+	if projectConfig == nil || len(projectConfig.Runtimes) == 0 {
+		return "", nil
+	}
+	if len(projectConfig.Runtimes) == 1 {
+		for runtime := range projectConfig.Runtimes {
+			return runtime, nil
+		}
+	}
+	if p == nil {
+		return "", fmt.Errorf("runtime selection required")
+	}
+	ids := make([]string, 0, len(projectConfig.Runtimes))
+	for runtime := range projectConfig.Runtimes {
+		ids = append(ids, runtime)
+	}
+	sort.Strings(ids)
+	idx, err := p.Select("Select runtime", func() []ui.Option {
+		out := make([]ui.Option, 0, len(ids))
+		for _, id := range ids {
+			out = append(out, ui.Option{Label: id})
+		}
+		return out
+	}(), 0)
+	if err != nil {
+		return "", err
+	}
+	if idx < 0 || idx >= len(ids) {
+		return "", fmt.Errorf("invalid runtime selection")
+	}
+	return ids[idx], nil
+}
+
+func (a *App) writeApplyDesiredState(scope config.Scope, projectConfig *model.ProjectConfig, runtimeID string, opts ApplyOptions) error {
+	if projectConfig.Runtimes == nil {
+		projectConfig.Runtimes = model.CloneRuntimeEnablement(nil)
+	}
+	if runtimeID == "" {
+		return a.Workspace.WriteProjectConfigForScope(scope, *projectConfig)
+	}
+	enablement := projectConfig.Runtimes[runtimeID]
+	if !opts.Skill && len(opts.Skills) == 0 && a.Prompter != nil {
+		declared := make([]ui.Option, 0, len(projectConfig.Skills))
+		defaults := []int{}
+		for i, sk := range projectConfig.Skills {
+			declared = append(declared, ui.Option{Label: sk.ID})
+			if containsString(enablement.Skills, sk.ID) {
+				defaults = append(defaults, i)
+			}
+		}
+		idxs, err := a.Prompter.MultiSelect("Select runtime skills", declared, defaults)
+		if err != nil {
+			return err
+		}
+		selected := make([]string, 0, len(idxs))
+		for _, idx := range idxs {
+			if idx >= 0 && idx < len(projectConfig.Skills) {
+				selected = append(selected, projectConfig.Skills[idx].ID)
+			}
+		}
+		enablement.Skills = selected
+	} else if opts.Skill || len(opts.Skills) > 0 {
+		enablement.Skills = append([]string(nil), opts.Skills...)
+	}
+	if !opts.Plugin && len(opts.Plugins) == 0 && a.Prompter != nil {
+		declared := make([]ui.Option, 0, len(projectConfig.Plugins))
+		defaults := []int{}
+		for i, pl := range projectConfig.Plugins {
+			declared = append(declared, ui.Option{Label: pl.ID})
+			if containsString(enablement.Plugins, pl.ID) {
+				defaults = append(defaults, i)
+			}
+		}
+		idxs, err := a.Prompter.MultiSelect("Select runtime plugins", declared, defaults)
+		if err != nil {
+			return err
+		}
+		selected := make([]string, 0, len(idxs))
+		for _, idx := range idxs {
+			if idx >= 0 && idx < len(projectConfig.Plugins) {
+				selected = append(selected, projectConfig.Plugins[idx].ID)
+			}
+		}
+		enablement.Plugins = selected
+	} else if opts.Plugin || len(opts.Plugins) > 0 {
+		enablement.Plugins = append([]string(nil), opts.Plugins...)
+	}
+	if !opts.AgentMode && len(opts.Agents) == 0 && a.Prompter != nil {
+		declared := make([]ui.Option, 0, len(projectConfig.Agents))
+		defaults := []int{}
+		for i, ag := range projectConfig.Agents {
+			declared = append(declared, ui.Option{Label: ag.ID})
+			if containsString(enablement.Agents, ag.ID) {
+				defaults = append(defaults, i)
+			}
+		}
+		idxs, err := a.Prompter.MultiSelect("Select runtime agents", declared, defaults)
+		if err != nil {
+			return err
+		}
+		selected := make([]string, 0, len(idxs))
+		for _, idx := range idxs {
+			if idx >= 0 && idx < len(projectConfig.Agents) {
+				selected = append(selected, projectConfig.Agents[idx].ID)
+			}
+		}
+		enablement.Agents = selected
+	} else if opts.AgentMode || len(opts.Agents) > 0 {
+		enablement.Agents = append([]string(nil), opts.Agents...)
+	}
+	projectConfig.Runtimes[runtimeID] = enablement
+	return a.Workspace.WriteProjectConfigForScope(scope, *projectConfig)
 }
 
 func selectCatalogSkills(p ui.Prompter, catalog []model.CatalogSkill, opts AddOptions) ([]model.CatalogSkill, error) {
+	if len(catalog) == 0 {
+		return nil, fmt.Errorf("no valid skill resource found")
+	}
 	if opts.All {
 		return catalog, nil
 	}
 	if len(opts.Skills) > 0 {
-		wanted := map[string]bool{}
+		wanted := model.NewStringSet()
 		for _, id := range opts.Skills {
-			wanted[id] = true
+			wanted.Add(id)
 		}
 		out := make([]model.CatalogSkill, 0, len(opts.Skills))
 		for _, skill := range catalog {
-			if wanted[skill.ID] {
+			if wanted.Has(skill.ID) {
 				out = append(out, skill)
 			}
-			delete(wanted, skill.ID)
+			wanted.Delete(skill.ID)
 		}
-		if len(wanted) > 0 {
+		if wanted.Len() > 0 {
 			missing := make([]string, 0, len(wanted))
 			for id := range wanted {
 				missing = append(missing, id)
@@ -1307,25 +1683,56 @@ func selectCatalogSkills(p ui.Prompter, catalog []model.CatalogSkill, opts AddOp
 		}
 		return out, nil
 	}
-	return nil, fmt.Errorf("no skills available")
+	return nil, fmt.Errorf("no valid skill resource found")
+}
+
+func selectAgentResources(p ui.Prompter, agents []model.AgentResource, opts AddOptions) ([]model.AgentResource, error) {
+	if len(agents) == 0 {
+		return nil, fmt.Errorf("no valid agent resource found")
+	}
+	if len(agents) == 1 {
+		return agents, nil
+	}
+	if p != nil {
+		indexes, err := p.MultiSelect("Select agents", agentOptions(agents), nil)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]model.AgentResource, 0, len(indexes))
+		for _, i := range indexes {
+			if i >= 0 && i < len(agents) {
+				out = append(out, agents[i])
+			}
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("no valid agent resource found")
+}
+
+func agentOptions(agents []model.AgentResource) []ui.Option {
+	out := make([]ui.Option, 0, len(agents))
+	for _, agent := range agents {
+		out = append(out, ui.Option{Label: agent.ID})
+	}
+	return out
 }
 
 func selectInstalledSkills(items []model.InstalledSkill, ids []string) ([]model.InstalledSkill, error) {
 	if len(ids) == 0 {
 		return items, nil
 	}
-	wanted := map[string]bool{}
+	wanted := model.NewStringSet()
 	for _, id := range ids {
-		wanted[id] = true
+		wanted.Add(id)
 	}
 	out := make([]model.InstalledSkill, 0, len(ids))
 	for _, item := range items {
-		if wanted[item.ID] {
+		if wanted.Has(item.ID) {
 			out = append(out, item)
-			delete(wanted, item.ID)
+			wanted.Delete(item.ID)
 		}
 	}
-	if len(wanted) > 0 {
+	if wanted.Len() > 0 {
 		missing := make([]string, 0, len(wanted))
 		for id := range wanted {
 			missing = append(missing, id)
@@ -1383,9 +1790,10 @@ func catalogOptions(catalog []model.CatalogSkill) []ui.Option {
 type AddOptions struct {
 	Scope          config.Scope
 	Source         model.Source
+	ResourceKind   model.ResourceKind
 	All            bool
 	Skills         []string
-	ExposureMethod string
+	ExposureMethod model.ExposureMethod
 	Agent          string
 	Force          bool
 }
@@ -1399,23 +1807,15 @@ type RemoveOptions struct {
 }
 
 type ListOptions struct {
-	Scope config.Scope
-	JSON  bool
-	All   bool
+	Scope   config.Scope
+	JSON    bool
+	All     bool
+	Skill   bool
+	Plugins bool
 }
 
 type InspectOptions struct {
 	Scope  config.Scope
 	Source model.Source
 	JSON   bool
-}
-
-type ApplyOptions struct {
-	Scope          config.Scope
-	Skills         []string
-	Agents         []string
-	ExposureMethod string
-	Agent          string
-	Force          bool
-	JSON           bool
 }

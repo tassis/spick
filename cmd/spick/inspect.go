@@ -7,21 +7,19 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/tassis/spick/internal/app"
-	"github.com/tassis/spick/internal/config"
 )
 
 var inspectOpts struct {
-	scope  string
-	source string
-	json   bool
+	json bool
 }
 
 var inspectCmd = &cobra.Command{
 	Use:   "inspect",
-	Short: "Inspect a skill source",
+	Short: "Inspect a source",
+	Long:  "Inspect a source using manifest-first repo detection. Resource repos use spick.res.yaml and do not fall back to plugin classification without a manifest.",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		result, err := appService.Inspect(app.InspectOptions{Scope: config.Scope(inspectOpts.scope), Source: app.SourceFromLocator(args[0]), JSON: inspectOpts.json})
+		result, err := appService.Inspect(app.InspectOptions{Source: app.SourceFromLocator(args[0]), JSON: inspectOpts.json})
 		if err != nil {
 			return err
 		}
@@ -51,7 +49,6 @@ var inspectCmd = &cobra.Command{
 }
 
 func init() {
-	inspectCmd.Flags().StringVar(&inspectOpts.scope, "scope", string(config.ScopeProject), "scope to operate in")
 	inspectCmd.Flags().BoolVar(&inspectOpts.json, "json", false, "emit JSON")
 	inspectCmd.SetUsageFunc(func(cmd *cobra.Command) error {
 		_, err := fmt.Fprintf(cmd.OutOrStderr(), "Usage:\n  %s <source> [flags]\n", cmd.CommandPath())

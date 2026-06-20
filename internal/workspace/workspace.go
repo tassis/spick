@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"github.com/tassis/spick/internal/config"
@@ -34,41 +33,47 @@ type Loader struct {
 	Root string
 }
 
-type ProjectConfig struct {
-	Skills         []model.ProjectSkill
-	Plugins        []model.ProjectPlugin
-	Agents         map[string]model.ProjectAgentEnablement
-	ExposureMethod string
-	AutoApply      bool
-}
-
-type Manifest struct {
-	Version int                 `yaml:"version"`
-	Project model.ProjectConfig `yaml:"project"`
-	Skills  []ManifestSkill     `yaml:"skills"`
-}
-
-type ManifestSkill struct {
-	ID          string `yaml:"id"`
-	Path        string `yaml:"path"`
-	Name        string `yaml:"name"`
-	Description string `yaml:"description"`
-}
-
-type ManifestPlugin struct {
-	Source string `yaml:"source"`
-	Ref    string `yaml:"ref"`
-}
+type ResourceManifest = model.ResourceManifest
 
 type projectAssetDecl struct {
 	ID     string `yaml:"id"`
 	Source string `yaml:"source"`
+	Path   string `yaml:"path"`
 	Ref    string `yaml:"ref"`
+}
+
+type projectAgentDecls []projectAssetDecl
+
+func (d *projectAgentDecls) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.SequenceNode:
+		var items []projectAssetDecl
+		if err := value.Decode(&items); err != nil {
+			return err
+		}
+		*d = items
+		return nil
+	case yaml.MappingNode:
+		var m map[string]projectAssetDecl
+		if err := value.Decode(&m); err != nil {
+			return err
+		}
+		items := make([]projectAssetDecl, 0, len(m))
+		for id, item := range m {
+			item.ID = id
+			items = append(items, item)
+		}
+		*d = items
+		return nil
+	default:
+		return nil
+	}
 }
 
 type agentEntry struct {
 	Skills  []string `yaml:"skills"`
 	Plugins []string `yaml:"plugins"`
+	Agents  []string `yaml:"agents"`
 }
 
 type ParsedSource struct {
@@ -183,21 +188,25 @@ func hostedURL(parsed *ParsedSource) string {
 }
 
 func (l *Loader) LoadCatalog() ([]model.CatalogSkill, error) {
-	manifest, err := l.LoadSkillCatalogManifest()
+	manifest, err := l.LoadResourceCatalogManifest()
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return l.DiscoverCatalog()
 		}
 		return nil, err
 	}
-	if len(manifest.Skills) == 0 {
+	if len(manifest.Resources.Skills) == 0 {
 		return l.DiscoverCatalog()
 	}
-	return l.NormalizeCatalog(manifest)
+	return l.NormalizeResourceCatalog(manifest)
 }
 
-func (l *Loader) LoadSkillCatalogManifest() (*Manifest, error) {
-	manifestPath := filepath.Join(l.Root, "spick.skill.yaml")
+func (l *Loader) LoadResourceManifest() (*model.ResourceManifest, error) {
+	return l.LoadResourceCatalogManifest()
+}
+
+func (l *Loader) LoadResourceCatalogManifest() (*model.ResourceManifest, error) {
+	manifestPath := filepath.Join(l.Root, "spick.res.yaml")
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -205,19 +214,35 @@ func (l *Loader) LoadSkillCatalogManifest() (*Manifest, error) {
 		}
 		return nil, fmt.Errorf("load manifest: %w", err)
 	}
-	return parseManifest(data)
+	return parseResourceManifest(data)
 }
 
-func (w *Workspace) LoadProjectConfig() (*ProjectConfig, error) {
-	loader := &Loader{Root: w.Root}
+func (w *Workspace) LoadProjectConfig() (*model.ProjectConfig, error) {
+	return w.LoadProjectConfigForScope(config.ScopeProject)
+}
+
+func (w *Workspace) LoadProjectConfigForScope(scope config.Scope) (*model.ProjectConfig, error) {
+	loader := &Loader{Root: w.rootForScope(scope)}
 	manifest, err := loader.LoadProjectManifest()
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return &ProjectConfig{AutoApply: true, Agents: map[string]model.ProjectAgentEnablement{}}, nil
+			return &model.ProjectConfig{AutoApply: true, Agents: []model.ProjectAgent{}, Runtimes: map[string]model.ProjectRuntimeEnablement{}}, nil
 		}
 		return nil, err
 	}
-	return &ProjectConfig{Skills: append([]model.ProjectSkill(nil), manifest.Project.Skills...), Plugins: append([]model.ProjectPlugin(nil), manifest.Project.Plugins...), Agents: cloneAgentEnablement(manifest.Project.Agents), ExposureMethod: manifest.Project.ExposureMethod, AutoApply: manifest.Project.AutoApply}, nil
+	declaredAgents := make([]model.ProjectAgent, 0, len(manifest.Agents))
+	for _, agent := range manifest.Agents {
+		declaredAgents = append(declaredAgents, model.ProjectAgent{ID: agent.ID, Source: agent.Source, Path: agent.Path, Ref: agent.Ref})
+	}
+	return &model.ProjectConfig{Skills: append([]model.ProjectSkill(nil), manifest.Skills...), Plugins: append([]model.ProjectPlugin(nil), manifest.Plugins...), Agents: declaredAgents, Runtimes: model.CloneRuntimeEnablement(manifest.Runtimes), ExposureMethod: manifest.ExposureMethod, AutoApply: manifest.AutoApply}, nil
+}
+
+func (w *Workspace) LoadResourceManifest() (*model.ResourceManifest, error) {
+	return (&Loader{Root: w.Root}).LoadResourceManifest()
+}
+
+func (w *Workspace) DiscoverAgentResources() ([]model.AgentResource, error) {
+	return (&Loader{Root: w.Root}).DiscoverAgentResources()
 }
 
 func (w *Workspace) WriteProjectPlugins(plugins []model.ProjectPlugin) error {
@@ -227,7 +252,8 @@ func (w *Workspace) WriteProjectPlugins(plugins []model.ProjectPlugin) error {
 		Project struct {
 			Skills         []projectAssetDecl    `yaml:"skills"`
 			Plugins        []projectAssetDecl    `yaml:"plugins"`
-			Agents         map[string]agentEntry `yaml:"agents"`
+			Agents         projectAgentDecls     `yaml:"agents"`
+			Runtimes       map[string]agentEntry `yaml:"runtimes"`
 			ExposureMethod string                `yaml:"exposureMethod"`
 			AutoApply      *bool                 `yaml:"autoApply"`
 		} `yaml:"project"`
@@ -262,7 +288,8 @@ func (w *Workspace) WriteProjectSkills(skills []model.ProjectSkill) error {
 		Project struct {
 			Skills         []projectAssetDecl    `yaml:"skills"`
 			Plugins        []projectAssetDecl    `yaml:"plugins"`
-			Agents         map[string]agentEntry `yaml:"agents"`
+			Agents         projectAgentDecls     `yaml:"agents"`
+			Runtimes       map[string]agentEntry `yaml:"runtimes"`
 			ExposureMethod string                `yaml:"exposureMethod"`
 			AutoApply      *bool                 `yaml:"autoApply"`
 		} `yaml:"project"`
@@ -297,7 +324,8 @@ func (w *Workspace) WriteProjectAgentEnablement(agent string, skills []string, p
 		Project struct {
 			Skills         []projectAssetDecl    `yaml:"skills"`
 			Plugins        []projectAssetDecl    `yaml:"plugins"`
-			Agents         map[string]agentEntry `yaml:"agents"`
+			Agents         projectAgentDecls     `yaml:"agents"`
+			Runtimes       map[string]agentEntry `yaml:"runtimes"`
 			ExposureMethod string                `yaml:"exposureMethod"`
 			AutoApply      *bool                 `yaml:"autoApply"`
 		} `yaml:"project"`
@@ -310,10 +338,10 @@ func (w *Workspace) WriteProjectAgentEnablement(agent string, skills []string, p
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	if raw.Project.Agents == nil {
-		raw.Project.Agents = map[string]agentEntry{}
+	if raw.Project.Runtimes == nil {
+		raw.Project.Runtimes = map[string]agentEntry{}
 	}
-	raw.Project.Agents[agent] = agentEntry{Skills: append([]string(nil), skills...), Plugins: append([]string(nil), plugins...)}
+	raw.Project.Runtimes[agent] = agentEntry{Skills: append([]string(nil), skills...), Plugins: append([]string(nil), plugins...)}
 	if raw.Version == nil {
 		v := 1
 		raw.Version = &v
@@ -325,6 +353,87 @@ func (w *Workspace) WriteProjectAgentEnablement(agent string, skills []string, p
 	return os.WriteFile(path, out, 0o644)
 }
 
+func (w *Workspace) WriteProjectConfig(project model.ProjectConfig) error {
+	return w.WriteProjectConfigForScope(config.ScopeProject, project)
+}
+
+func (w *Workspace) WriteProjectConfigForScope(scope config.Scope, project model.ProjectConfig) error {
+	path := filepath.Join(w.rootForScope(scope), "spick.yaml")
+	var raw struct {
+		Version *int `yaml:"version"`
+		Project struct {
+			Skills         []projectAssetDecl    `yaml:"skills"`
+			Plugins        []projectAssetDecl    `yaml:"plugins"`
+			Agents         projectAgentDecls     `yaml:"agents"`
+			Runtimes       map[string]agentEntry `yaml:"runtimes"`
+			ExposureMethod string                `yaml:"exposureMethod"`
+			AutoApply      *bool                 `yaml:"autoApply"`
+		} `yaml:"project"`
+	}
+	for _, skill := range project.Skills {
+		raw.Project.Skills = append(raw.Project.Skills, projectAssetDecl{ID: skill.ID, Source: skill.Source, Ref: skill.Ref})
+	}
+	for _, plugin := range project.Plugins {
+		raw.Project.Plugins = append(raw.Project.Plugins, projectAssetDecl{ID: plugin.ID, Source: plugin.Source, Ref: plugin.Ref})
+	}
+	if len(project.Agents) > 0 {
+		for _, agent := range project.Agents {
+			raw.Project.Agents = append(raw.Project.Agents, projectAssetDecl{ID: agent.ID, Source: agent.Source, Path: agent.Path, Ref: agent.Ref})
+		}
+	}
+	if len(project.Runtimes) > 0 {
+		raw.Project.Runtimes = map[string]agentEntry{}
+		for name, runtime := range project.Runtimes {
+			raw.Project.Runtimes[name] = agentEntry{Skills: append([]string(nil), runtime.Skills...), Plugins: append([]string(nil), runtime.Plugins...), Agents: append([]string(nil), runtime.Agents...)}
+		}
+	}
+	raw.Project.ExposureMethod = string(project.ExposureMethod)
+	raw.Project.AutoApply = &project.AutoApply
+	if raw.Version == nil {
+		v := 1
+		raw.Version = &v
+	}
+	out, err := yaml.Marshal(&raw)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, out, 0o644)
+}
+
+func (w *Workspace) WriteResourceManifest(manifest model.ResourceManifest) error {
+	path := filepath.Join(w.Root, "spick.res.yaml")
+	normalized := model.NormalizeResourceManifestForPersistence(manifest)
+	var raw struct {
+		Version   *int                      `yaml:"version"`
+		Kind      model.ResourceKind        `yaml:"kind"`
+		Plugin    *model.ResourcePlugin     `yaml:"plugin"`
+		Resources model.ResourceCollections `yaml:"resources"`
+	}
+	raw.Version = &normalized.Version
+	raw.Kind = normalized.Kind
+	raw.Plugin = normalized.Plugin
+	raw.Resources = model.ResourceCollections{
+		Skills: append([]model.ResourceSkill(nil), normalized.Resources.Skills...),
+		Agents: append([]model.AgentResource(nil), normalized.Resources.Agents...),
+	}
+	out, err := yaml.Marshal(&raw)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, out, 0o644)
+}
+
+func (w *Workspace) rootForScope(scope config.Scope) string {
+	if scope == config.ScopeGlobal {
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			return filepath.Join(".", ".spick")
+		}
+		return filepath.Join(home, ".spick")
+	}
+	return w.Root
+}
+
 func (w *Workspace) RemoveProjectSkills(ids []string) error {
 	path := filepath.Join(w.Root, "spick.yaml")
 	var raw struct {
@@ -332,7 +441,8 @@ func (w *Workspace) RemoveProjectSkills(ids []string) error {
 		Project struct {
 			Skills         []projectAssetDecl    `yaml:"skills"`
 			Plugins        []projectAssetDecl    `yaml:"plugins"`
-			Agents         map[string]agentEntry `yaml:"agents"`
+			Agents         projectAgentDecls     `yaml:"agents"`
+			Runtimes       map[string]agentEntry `yaml:"runtimes"`
 			ExposureMethod string                `yaml:"exposureMethod"`
 			AutoApply      *bool                 `yaml:"autoApply"`
 		} `yaml:"project"`
@@ -345,9 +455,9 @@ func (w *Workspace) RemoveProjectSkills(ids []string) error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	remove := map[string]struct{}{}
+	remove := model.NewStringSet()
 	for _, id := range ids {
-		remove[id] = struct{}{}
+		remove.Add(id)
 	}
 	if len(raw.Project.Skills) > 0 {
 		keep := raw.Project.Skills[:0]
@@ -358,9 +468,9 @@ func (w *Workspace) RemoveProjectSkills(ids []string) error {
 		}
 		raw.Project.Skills = keep
 	}
-	for agent, entry := range raw.Project.Agents {
+	for agent, entry := range raw.Project.Runtimes {
 		entry.Skills = filterStrings(entry.Skills, remove)
-		raw.Project.Agents[agent] = entry
+		raw.Project.Runtimes[agent] = entry
 	}
 	if raw.Version == nil {
 		v := 1
@@ -380,12 +490,13 @@ func (w *Workspace) RemoveProjectPlugins(ids []string) error {
 		Project struct {
 			Skills         []projectAssetDecl    `yaml:"skills"`
 			Plugins        []projectAssetDecl    `yaml:"plugins"`
-			Agents         map[string]agentEntry `yaml:"agents"`
+			Agents         projectAgentDecls     `yaml:"agents"`
+			Runtimes       map[string]agentEntry `yaml:"runtimes"`
 			ExposureMethod string                `yaml:"exposureMethod"`
 			AutoApply      *bool                 `yaml:"autoApply"`
 		} `yaml:"project"`
 		Catalog struct {
-			Skills []ManifestSkill `yaml:"skills"`
+			Skills []model.CatalogSkill `yaml:"skills"`
 		} `yaml:"catalog"`
 	}
 	data, err := os.ReadFile(path)
@@ -396,9 +507,9 @@ func (w *Workspace) RemoveProjectPlugins(ids []string) error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	remove := map[string]struct{}{}
+	remove := model.NewStringSet()
 	for _, id := range ids {
-		remove[id] = struct{}{}
+		remove.Add(id)
 	}
 	if len(raw.Project.Plugins) > 0 {
 		keep := raw.Project.Plugins[:0]
@@ -409,9 +520,9 @@ func (w *Workspace) RemoveProjectPlugins(ids []string) error {
 		}
 		raw.Project.Plugins = keep
 	}
-	for agent, entry := range raw.Project.Agents {
+	for agent, entry := range raw.Project.Runtimes {
 		entry.Plugins = filterStrings(entry.Plugins, remove)
-		raw.Project.Agents[agent] = entry
+		raw.Project.Runtimes[agent] = entry
 	}
 	if raw.Version == nil {
 		v := 1
@@ -424,20 +535,20 @@ func (w *Workspace) RemoveProjectPlugins(ids []string) error {
 	return os.WriteFile(path, out, 0o644)
 }
 
-func filterStrings(values []string, remove map[string]struct{}) []string {
+func filterStrings(values []string, remove model.StringSet) []string {
 	if len(values) == 0 {
 		return values
 	}
 	out := values[:0]
 	for _, v := range values {
-		if _, ok := remove[v]; !ok {
+		if !remove.Has(v) {
 			out = append(out, v)
 		}
 	}
 	return out
 }
 
-func (l *Loader) LoadProjectManifest() (*Manifest, error) {
+func (l *Loader) LoadProjectManifest() (*model.ProjectConfig, error) {
 	manifestPath := filepath.Join(l.Root, "spick.yaml")
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
@@ -446,7 +557,7 @@ func (l *Loader) LoadProjectManifest() (*Manifest, error) {
 		}
 		return nil, fmt.Errorf("load manifest: %w", err)
 	}
-	return parseManifest(data)
+	return parseProjectManifest(data)
 }
 
 func (l *Loader) DiscoverCatalog() ([]model.CatalogSkill, error) {
@@ -485,6 +596,9 @@ func (l *Loader) discoverEntries(entries []os.DirEntry, root, prefix string) []m
 		if !entry.IsDir() || excludedDir(entry.Name()) {
 			continue
 		}
+		if prefix == "" && filepath.Base(root) == "agents" {
+			continue
+		}
 		relDir := filepath.Join(prefix, entry.Name())
 		if _, err := os.Stat(filepath.Join(root, entry.Name(), "SKILL.md")); err == nil {
 			out = append(out, l.skillFromDir(entry.Name(), relDir))
@@ -493,29 +607,42 @@ func (l *Loader) discoverEntries(entries []os.DirEntry, root, prefix string) []m
 	return out
 }
 
+func (l *Loader) DiscoverAgentResources() ([]model.AgentResource, error) {
+	agentsRoot := filepath.Join(l.Root, "agents")
+	entries, err := os.ReadDir(agentsRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []model.AgentResource
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		if filepath.Ext(entry.Name()) != ".md" {
+			continue
+		}
+		id := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+		out = append(out, model.AgentResource{ID: id, Path: filepath.Join("agents", entry.Name()), Format: "markdown"})
+	}
+	return out, nil
+}
+
 func dirExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.IsDir()
 }
 
-func (l *Loader) NormalizeCatalog(m *Manifest) ([]model.CatalogSkill, error) {
-	if m == nil {
-		return nil, fmt.Errorf("manifest is required")
+func (l *Loader) NormalizeResourceCatalog(m *model.ResourceManifest) ([]model.CatalogSkill, error) {
+	skills, err := model.NormalizeResourceManifestSkills(m)
+	if err != nil {
+		return nil, err
 	}
-	if len(m.Skills) == 0 {
-		return nil, fmt.Errorf("skills is required")
-	}
-	seen := map[string]bool{}
-	out := make([]model.CatalogSkill, 0, len(m.Skills))
-	for _, skill := range m.Skills {
-		if !skillIDRe.MatchString(skill.ID) {
-			return nil, fmt.Errorf("invalid skill id %q", skill.ID)
-		}
-		if seen[skill.ID] {
-			return nil, fmt.Errorf("duplicate skill id %q", skill.ID)
-		}
-		seen[skill.ID] = true
-		resolved, err := l.resolveSkill(skill)
+	out := make([]model.CatalogSkill, 0, len(skills))
+	for _, skill := range skills {
+		resolved, err := l.resolveResourceSkill(skill)
 		if err != nil {
 			return nil, err
 		}
@@ -524,7 +651,7 @@ func (l *Loader) NormalizeCatalog(m *Manifest) ([]model.CatalogSkill, error) {
 	return out, nil
 }
 
-func (l *Loader) resolveSkill(skill ManifestSkill) (model.CatalogSkill, error) {
+func (l *Loader) resolveResourceSkill(skill model.ResourceSkill) (model.CatalogSkill, error) {
 	if skill.Path == "" {
 		return model.CatalogSkill{}, fmt.Errorf("skill %q path is required", skill.ID)
 	}
@@ -539,7 +666,7 @@ func (l *Loader) resolveSkill(skill ManifestSkill) (model.CatalogSkill, error) {
 	if _, err := os.Stat(filepath.Join(joined, "SKILL.md")); err != nil {
 		return model.CatalogSkill{}, fmt.Errorf("skill %q missing SKILL.md", skill.ID)
 	}
-	cs := model.CatalogSkill{ID: skill.ID, Name: skill.Name, Description: skill.Description, Source: &model.Source{Path: cleaned}}
+	cs := model.CatalogSkill{ID: skill.ID, Source: &model.Source{Path: cleaned}}
 	return cs, nil
 }
 
@@ -554,78 +681,6 @@ func excludedDir(name string) bool {
 	default:
 		return false
 	}
-}
-
-func cloneAgentEnablement(in map[string]model.ProjectAgentEnablement) map[string]model.ProjectAgentEnablement {
-	if len(in) == 0 {
-		return map[string]model.ProjectAgentEnablement{}
-	}
-	out := make(map[string]model.ProjectAgentEnablement, len(in))
-	for k, v := range in {
-		out[k] = model.ProjectAgentEnablement{Skills: append([]string(nil), v.Skills...), Plugins: append([]string(nil), v.Plugins...)}
-	}
-	return out
-}
-
-func normalizeProjectSkills(in []projectAssetDecl) ([]model.ProjectSkill, error) {
-	seen := map[string]struct{}{}
-	out := make([]model.ProjectSkill, 0, len(in))
-	for _, item := range in {
-		if strings.TrimSpace(item.ID) == "" || strings.TrimSpace(item.Source) == "" {
-			return nil, fmt.Errorf("invalid project.skills entry")
-		}
-		if _, ok := seen[item.ID]; ok {
-			return nil, fmt.Errorf("duplicate project.skills id %q", item.ID)
-		}
-		seen[item.ID] = struct{}{}
-		out = append(out, model.ProjectSkill{ID: item.ID, Source: item.Source, Ref: item.Ref})
-	}
-	return out, nil
-}
-
-func normalizeProjectPlugins(in []projectAssetDecl) ([]model.ProjectPlugin, error) {
-	seen := map[string]struct{}{}
-	out := make([]model.ProjectPlugin, 0, len(in))
-	for _, item := range in {
-		if strings.TrimSpace(item.ID) == "" || strings.TrimSpace(item.Source) == "" {
-			return nil, fmt.Errorf("invalid project.plugins entry")
-		}
-		if _, ok := seen[item.ID]; ok {
-			return nil, fmt.Errorf("duplicate project.plugins id %q", item.ID)
-		}
-		seen[item.ID] = struct{}{}
-		out = append(out, model.ProjectPlugin{ID: item.ID, Source: item.Source, Ref: item.Ref})
-	}
-	return out, nil
-}
-
-func normalizeAgentEnablement(in map[string]agentEntry, skills []model.ProjectSkill, plugins []model.ProjectPlugin) (map[string]model.ProjectAgentEnablement, error) {
-	declaredSkills := map[string]struct{}{}
-	for _, s := range skills {
-		declaredSkills[s.ID] = struct{}{}
-	}
-	declaredPlugins := map[string]struct{}{}
-	for _, p := range plugins {
-		declaredPlugins[p.ID] = struct{}{}
-	}
-	out := map[string]model.ProjectAgentEnablement{}
-	for agent, entry := range in {
-		if strings.TrimSpace(agent) == "" {
-			return nil, fmt.Errorf("invalid project.agents entry")
-		}
-		for _, id := range entry.Skills {
-			if _, ok := declaredSkills[id]; !ok {
-				return nil, fmt.Errorf("project.agents.%s references undeclared skill %q", agent, id)
-			}
-		}
-		for _, id := range entry.Plugins {
-			if _, ok := declaredPlugins[id]; !ok {
-				return nil, fmt.Errorf("project.agents.%s references undeclared plugin %q", agent, id)
-			}
-		}
-		out[agent] = model.ProjectAgentEnablement{Skills: append([]string(nil), entry.Skills...), Plugins: append([]string(nil), entry.Plugins...)}
-	}
-	return out, nil
 }
 
 func (w *Workspace) ParseSource(raw string) (*ParsedSource, error) {
@@ -698,50 +753,73 @@ func splitHostedPath(value string) []string {
 	return out
 }
 
-var skillIDRe = regexp.MustCompile(`^[a-z0-9_-]+$`)
+func parseResourceManifest(data []byte) (*model.ResourceManifest, error) {
+	var raw model.ResourceManifestRaw
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parse manifest: %w", err)
+	}
+	return model.ParseResourceManifest(raw)
+}
 
-func parseManifest(data []byte) (*Manifest, error) {
+func parseProjectManifest(data []byte) (*model.ProjectConfig, error) {
 	var raw struct {
 		Version *int `yaml:"version"`
 		Project struct {
 			Skills         []projectAssetDecl    `yaml:"skills"`
 			Plugins        []projectAssetDecl    `yaml:"plugins"`
-			Agents         map[string]agentEntry `yaml:"agents"`
+			Agents         projectAgentDecls     `yaml:"agents"`
+			Runtimes       map[string]agentEntry `yaml:"runtimes"`
 			ExposureMethod string                `yaml:"exposureMethod"`
 			AutoApply      *bool                 `yaml:"autoApply"`
 		} `yaml:"project"`
-		Skills []ManifestSkill `yaml:"skills"`
 	}
 	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parse manifest: %w", err)
 	}
+	exposureMethod := model.ExposureMethod("")
 	if raw.Project.ExposureMethod != "" {
-		switch raw.Project.ExposureMethod {
-		case "symlink", "copy":
-		default:
+		parsed, ok := model.ParseExposureMethod(raw.Project.ExposureMethod)
+		if !ok {
 			return nil, fmt.Errorf("invalid project.exposureMethod %q", raw.Project.ExposureMethod)
 		}
+		exposureMethod = parsed
 	}
-	skills, err := normalizeProjectSkills(raw.Project.Skills)
+	declSkills := make([]model.ProjectSkill, 0, len(raw.Project.Skills))
+	for _, item := range raw.Project.Skills {
+		declSkills = append(declSkills, model.ProjectSkill{ID: item.ID, Source: item.Source, Ref: item.Ref})
+	}
+	skills, err := model.NormalizeProjectSkills(declSkills)
 	if err != nil {
 		return nil, err
 	}
-	plugins, err := normalizeProjectPlugins(raw.Project.Plugins)
+	declPlugins := make([]model.ProjectPlugin, 0, len(raw.Project.Plugins))
+	for _, item := range raw.Project.Plugins {
+		declPlugins = append(declPlugins, model.ProjectPlugin{ID: item.ID, Source: item.Source, Ref: item.Ref})
+	}
+	plugins, err := model.NormalizeProjectPlugins(declPlugins)
 	if err != nil {
 		return nil, err
 	}
-	agents, err := normalizeAgentEnablement(raw.Project.Agents, skills, plugins)
+	declaredAgents := make([]model.ProjectAgent, 0, len(raw.Project.Agents))
+	for _, agent := range raw.Project.Agents {
+		declaredAgents = append(declaredAgents, model.ProjectAgent{ID: agent.ID, Source: agent.Source, Path: agent.Path, Ref: agent.Ref})
+	}
+	runtimeRaw := make(map[string]model.ProjectRuntimeEnablementRaw, len(raw.Project.Runtimes))
+	for agent, item := range raw.Project.Runtimes {
+		runtimeRaw[agent] = model.ProjectRuntimeEnablementRaw{
+			Skills:  append([]string(nil), item.Skills...),
+			Plugins: append([]string(nil), item.Plugins...),
+			Agents:  append([]string(nil), item.Agents...),
+		}
+	}
+	runtimes, err := model.NormalizeProjectRuntimeEnablement(runtimeRaw, skills, plugins, declaredAgents)
 	if err != nil {
 		return nil, err
 	}
-	m := &Manifest{Version: 1, Skills: raw.Skills}
 	autoApply := true
 	if raw.Project.AutoApply != nil {
 		autoApply = *raw.Project.AutoApply
 	}
-	m.Project = model.ProjectConfig{Skills: skills, Plugins: plugins, Agents: agents, ExposureMethod: raw.Project.ExposureMethod, AutoApply: autoApply}
-	if raw.Version != nil {
-		m.Version = *raw.Version
-	}
-	return m, nil
+	project := model.ProjectConfig{Skills: skills, Plugins: plugins, Agents: declaredAgents, Runtimes: runtimes, ExposureMethod: exposureMethod, AutoApply: autoApply}
+	return &project, nil
 }

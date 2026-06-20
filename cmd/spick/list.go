@@ -3,7 +3,6 @@ package spick
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -13,15 +12,20 @@ import (
 )
 
 var listOpts struct {
-	scope string
-	json  bool
+	skill   bool
+	plugins bool
+	json    bool
 }
 
 var listCmd = &cobra.Command{
 	Use:   "list",
-	Short: "List skills",
+	Short: "Show project overview",
+	Long:  "Show skills, plugins, and agents by default. Use --skill or --plugins to narrow the output.",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		result, err := appService.List(app.ListOptions{Scope: config.Scope(listOpts.scope), JSON: listOpts.json})
+		if listOpts.skill && listOpts.plugins {
+			return fmt.Errorf("--skill and --plugins are mutually exclusive")
+		}
+		result, err := appService.List(app.ListOptions{Scope: config.ScopeProject, JSON: listOpts.json, Skill: listOpts.skill, Plugins: listOpts.plugins})
 		if err != nil {
 			return err
 		}
@@ -33,42 +37,87 @@ var listCmd = &cobra.Command{
 			_, err = fmt.Fprintln(cmd.OutOrStdout(), string(data))
 			return err
 		}
-		if len(result.Skills) == 0 {
-			return nil
+		sections := []struct {
+			title string
+			lines []string
+		}{}
+		switch {
+		case listOpts.skill:
+			sections = append(sections, struct {
+				title string
+				lines []string
+			}{"skills", formatSkills(result.Skills)})
+		case listOpts.plugins:
+			sections = append(sections, struct {
+				title string
+				lines []string
+			}{"plugins", formatPlugins(result.Plugins)})
+		default:
+			sections = append(sections,
+				struct {
+					title string
+					lines []string
+				}{"skills", formatSkills(result.Skills)},
+				struct {
+					title string
+					lines []string
+				}{"plugins", formatPlugins(result.Plugins)},
+				struct {
+					title string
+					lines []string
+				}{"agents", formatAgents(result.Agents)},
+			)
 		}
-		lines := make([]string, 0, len(result.Skills))
-		for _, sk := range result.Skills {
-			lines = append(lines, fmt.Sprintf("%s%s", sk.ID, appliedAgentsBadge(sk)))
+		out := []string{}
+		for _, section := range sections {
+			out = append(out, section.title)
+			if len(section.lines) == 0 {
+				out = append(out, "  (none)")
+				continue
+			}
+			for _, line := range section.lines {
+				out = append(out, "  "+line)
+			}
 		}
-		_, err = fmt.Fprintln(cmd.OutOrStdout(), strings.Join(lines, "\n"))
+		_, err = fmt.Fprintln(cmd.OutOrStdout(), strings.Join(out, "\n"))
 		return err
 	},
 }
 
-func appliedAgentsBadge(sk model.InstalledSkill) string {
-	if len(sk.Exposures) == 0 {
-		return ""
+func formatSkills(items []model.InstalledSkill) []string {
+	out := make([]string, 0, len(items))
+	for _, sk := range items {
+		out = append(out, sk.ID)
 	}
-	agents := make([]string, 0, len(sk.Exposures))
-	seen := map[string]struct{}{}
-	for _, exposure := range sk.Exposures {
-		if exposure.Agent == "" {
-			continue
+	return out
+}
+
+func formatPlugins(items []app.PluginListItem) []string {
+	out := make([]string, 0, len(items))
+	for _, pl := range items {
+		line := pl.ID
+		if pl.State != "" {
+			line += " (" + pl.State + ")"
 		}
-		if _, ok := seen[exposure.Agent]; ok {
-			continue
+		if pl.Warning != "" {
+			line += " - " + pl.Warning
 		}
-		seen[exposure.Agent] = struct{}{}
-		agents = append(agents, exposure.Agent)
+		out = append(out, line)
 	}
-	if len(agents) == 0 {
-		return ""
+	return out
+}
+
+func formatAgents(items []app.AgentListItem) []string {
+	out := make([]string, 0, len(items))
+	for _, agent := range items {
+		line := agent.ID + ": skills=" + fmt.Sprint(agent.Skills) + " plugins=" + fmt.Sprint(agent.Plugins)
+		out = append(out, line)
 	}
-	sort.Strings(agents)
-	return fmt.Sprintf(" [%s]", strings.Join(agents, ", "))
+	return out
 }
 
 func init() {
-	listCmd.Flags().StringVar(&listOpts.scope, "scope", string(config.ScopeProject), "scope to operate in")
+	listCmd.Flags().BoolVar(&listOpts.skill, "skill", false, "show skills only")
+	listCmd.Flags().BoolVar(&listOpts.plugins, "plugins", false, "show plugins only")
 	listCmd.Flags().BoolVar(&listOpts.json, "json", false, "emit JSON")
 }

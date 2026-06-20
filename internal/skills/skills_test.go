@@ -69,7 +69,7 @@ func TestMaterializeCopy(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(srcDir, "extra.txt"), []byte("more"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	res, err := s.materializeSkill(AddOptions{Scope: "project", SourceRoot: filepath.Join(root, "src"), ExposureMethod: "copy"}, model.CatalogSkill{ID: "demo", Source: &model.Source{Path: filepath.Join("skills", "foo")}})
+	res, err := s.materializeSkill(AddOptions{Scope: "project", SourceRoot: filepath.Join(root, "src"), ExposureMethod: model.ExposureMethodCopy}, model.CatalogSkill{ID: "demo", Source: &model.Source{Path: filepath.Join("skills", "foo")}})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestMaterializeSymlinkCreatesExposure(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(srcDir, "extra.txt"), []byte("more"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	res, err := s.materializeSkill(AddOptions{Scope: "project", SourceRoot: filepath.Join(root, "src"), ExposureMethod: "symlink"}, model.CatalogSkill{ID: "demo", Source: &model.Source{Path: "nested"}})
+	res, err := s.materializeSkill(AddOptions{Scope: "project", SourceRoot: filepath.Join(root, "src"), ExposureMethod: model.ExposureMethodSymlink}, model.CatalogSkill{ID: "demo", Source: &model.Source{Path: "nested"}})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestMaterializeCopyModeCopiesExposure(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(srcDir, "SKILL.md"), []byte("hello"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	res, err := s.materializeSkill(AddOptions{Scope: "project", SourceRoot: filepath.Join(root, "src"), ExposureMethod: "copy"}, model.CatalogSkill{ID: "demo", Source: &model.Source{Path: "nested"}})
+	res, err := s.materializeSkill(AddOptions{Scope: "project", SourceRoot: filepath.Join(root, "src"), ExposureMethod: model.ExposureMethodCopy}, model.CatalogSkill{ID: "demo", Source: &model.Source{Path: "nested"}})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -173,10 +173,10 @@ func TestMaterializeFailsOnExistingDestinationWithoutForce(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(srcDir, "SKILL.md"), []byte("hello"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.materializeSkill(AddOptions{Scope: "project", SourceRoot: filepath.Join(root, "src"), ExposureMethod: "copy"}, model.CatalogSkill{ID: "demo", Source: &model.Source{Path: "nested"}}); err != nil {
+	if _, err := s.materializeSkill(AddOptions{Scope: "project", SourceRoot: filepath.Join(root, "src"), ExposureMethod: model.ExposureMethodCopy}, model.CatalogSkill{ID: "demo", Source: &model.Source{Path: "nested"}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.materializeSkill(AddOptions{Scope: "project", SourceRoot: filepath.Join(root, "src"), ExposureMethod: "copy"}, model.CatalogSkill{ID: "demo", Source: &model.Source{Path: "nested"}}); err == nil {
+	if _, err := s.materializeSkill(AddOptions{Scope: "project", SourceRoot: filepath.Join(root, "src"), ExposureMethod: model.ExposureMethodCopy}, model.CatalogSkill{ID: "demo", Source: &model.Source{Path: "nested"}}); err == nil {
 		t.Fatal("expected conflict error")
 	}
 }
@@ -191,10 +191,10 @@ func TestMaterializeForceOverwrites(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(srcDir, "SKILL.md"), []byte("hello"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.materializeSkill(AddOptions{Scope: "project", SourceRoot: filepath.Join(root, "src"), ExposureMethod: "copy"}, model.CatalogSkill{ID: "demo", Source: &model.Source{Path: "nested"}}); err != nil {
+	if _, err := s.materializeSkill(AddOptions{Scope: "project", SourceRoot: filepath.Join(root, "src"), ExposureMethod: model.ExposureMethodCopy}, model.CatalogSkill{ID: "demo", Source: &model.Source{Path: "nested"}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.materializeSkill(AddOptions{Scope: "project", SourceRoot: filepath.Join(root, "src"), ExposureMethod: "copy", Force: true}, model.CatalogSkill{ID: "demo", Source: &model.Source{Path: "nested"}}); err != nil {
+	if _, err := s.materializeSkill(AddOptions{Scope: "project", SourceRoot: filepath.Join(root, "src"), ExposureMethod: model.ExposureMethodCopy, Force: true}, model.CatalogSkill{ID: "demo", Source: &model.Source{Path: "nested"}}); err != nil {
 		t.Fatalf("unexpected force error: %v", err)
 	}
 }

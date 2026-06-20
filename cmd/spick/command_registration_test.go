@@ -6,39 +6,56 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func TestRootRegistersSkillAndPluginGroups(t *testing.T) {
+func TestRootRegistersVerbFirstLifecycleGroups(t *testing.T) {
 	if got := childCommandNames(rootCmd); !containsName(got, "init") {
 		t.Fatalf("expected root to register init command, got %v", got)
 	}
-	if got := childCommandNames(rootCmd); !containsName(got, "skill") {
-		t.Fatalf("expected root to register skill group, got %v", got)
+	if got := childCommandNames(rootCmd); !containsName(got, "inspect") {
+		t.Fatalf("expected root to register inspect command, got %v", got)
 	}
-	if got := childCommandNames(rootCmd); !containsName(got, "plugin") {
-		t.Fatalf("expected root to register plugin group, got %v", got)
+	if got := childCommandNames(rootCmd); !containsName(got, "list") {
+		t.Fatalf("expected root to register list command, got %v", got)
 	}
-	if got := childCommandNames(rootCmd); containsName(got, "add") {
-		t.Fatalf("did not expect flat add command at root, got %v", got)
+	if got := childCommandNames(rootCmd); !containsName(got, "add") {
+		t.Fatalf("expected root to register add command, got %v", got)
+	}
+	if got := childCommandNames(rootCmd); !containsName(got, "rm") {
+		t.Fatalf("expected root to register rm command, got %v", got)
+	}
+	if got := childCommandNames(rootCmd); !containsName(got, "apply") {
+		t.Fatalf("expected root to register apply command, got %v", got)
 	}
 	if got := childCommandNames(rootCmd); !containsName(got, "sync") {
 		t.Fatalf("expected root to register sync command, got %v", got)
 	}
 }
 
-func TestSkillGroupRegistersLifecycleCommands(t *testing.T) {
-	got := childCommandNames(skillCmd)
-	for _, name := range []string{"add", "inspect", "list", "rm", "apply"} {
-		if !containsName(got, name) {
-			t.Fatalf("expected skill group to register %s, got %v", name, got)
-		}
+func TestAddGroupIsSourceOriented(t *testing.T) {
+	if got := childCommandNames(addCmd); len(got) != 0 {
+		t.Fatalf("expected add to have no child commands, got %v", got)
 	}
 }
 
-func TestPluginGroupRegistersPluginCommands(t *testing.T) {
-	got := childCommandNames(pluginCmd)
-	for _, name := range []string{"add", "inspect", "list", "rm"} {
-		if !containsName(got, name) {
-			t.Fatalf("expected plugin group to register %s, got %v", name, got)
+func TestRmGroupIsSourceOriented(t *testing.T) {
+	if got := childCommandNames(rmCmd); len(got) != 0 {
+		t.Fatalf("expected rm to have no child commands, got %v", got)
+	}
+}
+
+func TestApplyIsRootLevelAndUnnested(t *testing.T) {
+	if !containsName(childCommandNames(rootCmd), "apply") {
+		t.Fatalf("expected root to register apply command, got %v", childCommandNames(rootCmd))
+	}
+	if got := childCommandNames(applyCmd); len(got) != 0 {
+		t.Fatalf("expected apply to have no child commands, got %v", got)
+	}
+	for _, name := range []string{"global", "skill", "plugin", "agent"} {
+		if applyCmd.Flags().Lookup(name) == nil {
+			t.Fatalf("expected apply to register --%s flag", name)
 		}
+	}
+	if applyCmd.Flags().Lookup("scope") != nil {
+		t.Fatal("did not expect --scope flag on apply")
 	}
 }
 

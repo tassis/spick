@@ -21,7 +21,7 @@ func TestListCommandHumanReadable(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "spick.yaml"), []byte("project:\n  agents:\n    opencode: {}\n    codex: {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "spick.skill.yaml"), []byte("version: 1\nskills:\n    - id: demo\n      path: .\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "spick.res.yaml"), []byte("version: 1\nkind: resources\nresources:\n  skills:\n    - id: demo\n      path: .\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	appService = app.New(ui.NewPromptTea(), workspace.New(root), skills.New(root))
@@ -32,11 +32,13 @@ func TestListCommandHumanReadable(t *testing.T) {
 	buf := &bytes.Buffer{}
 	listCmd.SetOut(buf)
 	listOpts.json = false
+	listOpts.skill = false
+	listOpts.plugins = false
 	if err := listCmd.RunE(listCmd, nil); err != nil {
 		t.Fatal(err)
 	}
 	output := buf.String()
-	if !strings.Contains(output, "demo [codex, opencode]") {
+	if !strings.Contains(output, "skills") || !strings.Contains(output, "plugins") || !strings.Contains(output, "agents") {
 		t.Fatalf("unexpected output: %q", buf.String())
 	}
 }
@@ -52,15 +54,17 @@ func TestListCommandJSON(t *testing.T) {
 	buf := &bytes.Buffer{}
 	listCmd.SetOut(buf)
 	listOpts.json = true
+	listOpts.skill = false
+	listOpts.plugins = false
 	if err := listCmd.RunE(listCmd, nil); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(buf.String(), `"exposures"`) {
+	if !strings.Contains(buf.String(), `"skills"`) {
 		t.Fatalf("unexpected json: %q", buf.String())
 	}
 }
 
-func TestListCommandHidesEmptyAgentBadge(t *testing.T) {
+func TestListCommandSkillFilter(t *testing.T) {
 	root := t.TempDir()
 	writeListTestFiles(t, root)
 	appService = app.New(ui.NewPromptTea(), workspace.New(root), skills.New(root))
@@ -69,24 +73,26 @@ func TestListCommandHidesEmptyAgentBadge(t *testing.T) {
 	}
 	buf := &bytes.Buffer{}
 	listCmd.SetOut(buf)
-	listOpts.json = false
+	listOpts.skill = true
+	defer func() { listOpts.skill = false }()
 	if err := listCmd.RunE(listCmd, nil); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.TrimSpace(buf.String()); got != "demo" {
-		t.Fatalf("expected plain skill name, got %q", got)
+	got := buf.String()
+	if !strings.Contains(got, "skills") || strings.Contains(got, "plugins") {
+		t.Fatalf("expected skill-only section, got %q", got)
 	}
 }
 
 func TestListSurfaceOmitsRemovedFlags(t *testing.T) {
-	if listCmd.Flags().Lookup("all") != nil {
-		t.Fatal("did not expect --all flag")
+	if listCmd.Flags().Lookup("scope") != nil {
+		t.Fatal("did not expect --scope flag")
 	}
 	if listCmd.Flags().Lookup("json") == nil {
 		t.Fatal("expected --json flag")
 	}
-	if listCmd.Flags().Lookup("scope") == nil {
-		t.Fatal("expected --scope flag")
+	if listCmd.Flags().Lookup("skill") == nil || listCmd.Flags().Lookup("plugins") == nil {
+		t.Fatal("expected --skill and --plugins flags")
 	}
 }
 
@@ -96,11 +102,13 @@ func TestListCommandEmptyPrintsNothing(t *testing.T) {
 	buf := &bytes.Buffer{}
 	listCmd.SetOut(buf)
 	listOpts.json = false
+	listOpts.skill = false
+	listOpts.plugins = false
 	if err := listCmd.RunE(listCmd, nil); err != nil {
 		t.Fatal(err)
 	}
-	if got := buf.String(); got != "" {
-		t.Fatalf("expected no output for empty list, got %q", got)
+	if got := buf.String(); !strings.Contains(got, "(none)") {
+		t.Fatalf("expected sectioned empty output, got %q", got)
 	}
 }
 
@@ -109,7 +117,7 @@ func writeListTestFiles(t *testing.T, root string) {
 	if err := os.MkdirAll(filepath.Join(root), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "spick.skill.yaml"), []byte("version: 1\nskills:\n    - id: demo\n      path: .\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "spick.res.yaml"), []byte("version: 1\nkind: resources\nresources:\n  skills:\n    - id: demo\n      path: .\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "SKILL.md"), []byte("# demo\n"), 0o644); err != nil {

@@ -49,6 +49,12 @@ func (s *Store) Read(scope string) (*model.Lockfile, error) {
 	if lf.Plugins == nil {
 		lf.Plugins = []model.LockPlugin{}
 	}
+	if lf.Agents == nil {
+		lf.Agents = []model.LockAgent{}
+	}
+	if lf.Runtimes == nil {
+		lf.Runtimes = map[string]model.LockRuntimeEntry{}
+	}
 	if lf.Scope == "" {
 		lf.Scope = scope
 	}
@@ -56,10 +62,14 @@ func (s *Store) Read(scope string) (*model.Lockfile, error) {
 }
 
 type lockfileWire struct {
-	Version int             `json:"version"`
-	Scope   string          `json:"scope,omitempty"`
-	Skills  json.RawMessage `json:"skills,omitempty"`
-	Plugins json.RawMessage `json:"plugins,omitempty"`
+	Version        int                        `json:"version"`
+	Scope          string                     `json:"scope,omitempty"`
+	ExposureMethod string                     `json:"exposureMethod,omitempty"`
+	AutoApply      *bool                      `json:"autoApply,omitempty"`
+	Skills         json.RawMessage            `json:"skills,omitempty"`
+	Plugins        json.RawMessage            `json:"plugins,omitempty"`
+	Agents         json.RawMessage            `json:"agents,omitempty"`
+	Runtimes       map[string]json.RawMessage `json:"runtimes,omitempty"`
 }
 
 type legacySkillRecord struct {
@@ -76,6 +86,16 @@ func parseLockfile(data []byte) (*model.Lockfile, error) {
 	}
 
 	lf := &model.Lockfile{Version: wire.Version, Scope: wire.Scope}
+	if wire.ExposureMethod != "" {
+		exposureMethod, ok := model.ParseExposureMethod(wire.ExposureMethod)
+		if !ok {
+			return nil, fmt.Errorf("invalid exposure method: %q", wire.ExposureMethod)
+		}
+		lf.ExposureMethod = exposureMethod
+	}
+	if wire.AutoApply != nil {
+		lf.AutoApply = *wire.AutoApply
+	}
 
 	if len(wire.Skills) > 0 && string(wire.Skills) != "null" {
 		skills, err := parseSkills(wire.Skills)
@@ -88,6 +108,23 @@ func parseLockfile(data []byte) (*model.Lockfile, error) {
 	if len(wire.Plugins) > 0 && string(wire.Plugins) != "null" {
 		if err := json.Unmarshal(wire.Plugins, &lf.Plugins); err != nil {
 			return nil, err
+		}
+	}
+	if len(wire.Agents) > 0 && string(wire.Agents) != "null" {
+		if err := json.Unmarshal(wire.Agents, &lf.Agents); err != nil {
+			return nil, err
+		}
+	}
+	if len(wire.Runtimes) > 0 {
+		lf.Runtimes = map[string]model.LockRuntimeEntry{}
+		for id, raw := range wire.Runtimes {
+			var entry model.LockRuntimeEntry
+			if len(raw) > 0 && string(raw) != "null" {
+				if err := json.Unmarshal(raw, &entry); err != nil {
+					return nil, err
+				}
+			}
+			lf.Runtimes[id] = entry
 		}
 	}
 
@@ -147,6 +184,9 @@ func (s *Store) Write(scope string, lf *model.Lockfile) error {
 	if lf.Scope == "" {
 		lf.Scope = scope
 	}
+	if lf.Runtimes == nil {
+		lf.Runtimes = map[string]model.LockRuntimeEntry{}
+	}
 	normalizeLockfilePaths(s.Root, scope, lf)
 	path := s.pathFor(scope)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -190,7 +230,8 @@ func (s *Store) UpsertInstalled(scope string, skills []model.InstalledSkill) err
 		byID[sk.ID] = i
 	}
 	for _, sk := range skills {
-		rec := model.LockSkill{ID: sk.ID, Declared: model.LockDeclared{}, Resolved: model.LockResolved{}, Materialized: model.LockMaterialized{Path: stableRel(s.Root, sk.Install.CanonicalPath)}, Projected: model.LockProjected{Mode: sk.Install.Mode, Exposures: normalizeExposures(s.Root, scope, sk.Exposures)}}
+		root := scopeRoot(s.Root, scope)
+		rec := model.LockSkill{ID: sk.ID, Declared: model.LockDeclared{}, Resolved: model.LockResolved{}, Materialized: model.LockMaterialized{Path: stableRel(root, sk.Install.CanonicalPath)}, Projected: model.LockProjected{Mode: sk.Install.Mode, Exposures: normalizeExposures(root, scope, sk.Exposures)}}
 		if sk.Source != nil {
 			rec.Declared = model.LockDeclared{Source: firstNonEmpty(sk.Source.CloneURL, sk.Source.Locator, sk.Source.Path), Ref: sk.Source.RequestedVersion}
 			rec.Resolved = model.LockResolved{Source: firstNonEmpty(sk.Source.CloneURL, sk.Source.Locator, sk.Source.Path), Ref: sk.Source.RequestedVersion, Revision: sk.Source.RequestedVersion}
@@ -224,6 +265,40 @@ func (s *Store) UpsertPlugins(scope string, plugins []model.LockPlugin) error {
 		}
 	}
 	return s.Write(scope, lf)
+}
+
+func (s *Store) UpsertAgents(scope string, agents []model.LockAgent) error {
+	lf, err := s.Read(scope)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if lf == nil {
+		lf = &model.Lockfile{Version: 1, Scope: scope}
+	}
+	byID := map[string]int{}
+	for i, ag := range lf.Agents {
+		byID[ag.ID] = i
+	}
+	for _, ag := range agents {
+		if idx, ok := byID[ag.ID]; ok {
+			lf.Agents[idx] = ag
+		} else {
+			lf.Agents = append(lf.Agents, ag)
+		}
+	}
+	return s.Write(scope, lf)
+}
+
+func (s *Store) ListAgents(scope string) ([]model.LockAgent, error) {
+	lf, err := s.Read(scope)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]model.LockAgent, 0, len(lf.Agents))
+	for _, ag := range lf.Agents {
+		out = append(out, ag)
+	}
+	return out, nil
 }
 
 func (s *Store) ListPlugins(scope string) ([]model.LockPlugin, error) {
@@ -430,11 +505,15 @@ func userHome() string {
 }
 
 func normalizeLockfilePaths(root, scope string, lf *model.Lockfile) {
+	root = scopeRoot(root, scope)
 	for i := range lf.Skills {
 		lf.Skills[i] = normalizeLockSkill(root, scope, lf.Skills[i])
 	}
 	for i := range lf.Plugins {
 		lf.Plugins[i] = normalizeLockPlugin(root, scope, lf.Plugins[i])
+	}
+	for i := range lf.Agents {
+		lf.Agents[i] = normalizeLockAgent(root, scope, lf.Agents[i])
 	}
 }
 
@@ -448,6 +527,26 @@ func normalizeLockPlugin(root, scope string, pl model.LockPlugin) model.LockPlug
 	pl.Materialized.Path = stableRel(root, pl.Materialized.Path)
 	pl.Projected.Path = stableRel(root, pl.Projected.Path)
 	return pl
+}
+
+func normalizeLockAgent(root, scope string, ag model.LockAgent) model.LockAgent {
+	ag.Path = stableRel(root, ag.Path)
+	if scope != "global" {
+		ag.Source = stableRel(root, ag.Source)
+	} else if ag.Source != "" {
+		ag.Source = filepath.Clean(ag.Source)
+	}
+	return ag
+}
+
+func scopeRoot(root string, scope string) string {
+	if scope == "global" {
+		return filepath.Join(userHome(), ".spick")
+	}
+	if root == "" {
+		return "."
+	}
+	return root
 }
 
 func firstNonEmpty(vals ...string) string {

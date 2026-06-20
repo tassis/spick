@@ -3,12 +3,11 @@ package workspace
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/tassis/spick/internal/model"
 )
-
-import "strings"
 
 func TestParseSourceGitHub(t *testing.T) {
 	w := New("/tmp")
@@ -124,7 +123,7 @@ func TestOpenSourceUsesRawCloneURL(t *testing.T) {
 	root := t.TempDir()
 	repo := t.TempDir()
 	mustWrite(t, filepath.Join(repo, "SKILL.md"), "# demo\n")
-	mustWrite(t, filepath.Join(repo, "spick.skill.yaml"), "version: 1\nskills:\n    - id: demo\n      path: .\n")
+	mustWrite(t, filepath.Join(repo, "spick.res.yaml"), "version: 1\nkind: resources\nresources:\n  skills:\n    - id: demo\n      path: .\n")
 	wrapper := filepath.Join(root, "git-wrapper.sh")
 	mustWrite(t, wrapper, "#!/bin/bash\nset -eu\nlog=\"$SPICK_GIT_LOG\"\n: > \"$log\"\nprintf '%s\\n' \"$@\" >> \"$log\"\nif [ \"$1\" = clone ]; then\n  dest=\"${@: -1}\"\n  cp -R \"$SPICK_GIT_TEMPLATE\"/. \"$dest\"\nfi\n")
 	if err := os.Chmod(wrapper, 0o755); err != nil {
@@ -156,7 +155,7 @@ func TestOpenSourceUsesRawCloneURL(t *testing.T) {
 
 func TestLoadCatalogValidManifest(t *testing.T) {
 	root := t.TempDir()
-	mustWrite(t, filepath.Join(root, "spick.skill.yaml"), "version: 1\nskills:\n    - id: demo\n      path: .\n      name: Demo\n")
+	mustWrite(t, filepath.Join(root, "spick.res.yaml"), "version: 1\nkind: resources\nresources:\n  skills:\n    - id: demo\n      path: .\n")
 	mustWrite(t, filepath.Join(root, "SKILL.md"), "# demo\n")
 	loader := &Loader{Root: root}
 	got, err := loader.LoadCatalog()
@@ -182,10 +181,10 @@ func TestLoadCatalogProjectOnlyFallsBackToTopLevelDiscovery(t *testing.T) {
 	}
 }
 
-func TestLoadCatalogProjectAndCatalogManifest(t *testing.T) {
+func TestLoadCatalogProjectAndResourceManifest(t *testing.T) {
 	root := t.TempDir()
 	mustWrite(t, filepath.Join(root, "spick.yaml"), "project:\n  skills: []\n  plugins: []\n  agents: {}\n  exposureMethod: copy\n")
-	mustWrite(t, filepath.Join(root, "spick.skill.yaml"), "version: 1\nskills:\n    - id: demo\n      path: .\n")
+	mustWrite(t, filepath.Join(root, "spick.res.yaml"), "version: 1\nkind: resources\nresources:\n  skills:\n    - id: demo\n      path: .\n")
 	mustWrite(t, filepath.Join(root, "SKILL.md"), "# demo\n")
 	loader := &Loader{Root: root}
 	got, err := loader.LoadCatalog()
@@ -194,6 +193,24 @@ func TestLoadCatalogProjectAndCatalogManifest(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].ID != "demo" {
 		t.Fatalf("unexpected manifest result: %+v", got)
+	}
+}
+
+func TestLoadCatalogDoesNotFallbackToPluginManifest(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "spick.res.yaml"), "version: 1\n")
+	if _, err := (&Loader{Root: root}).LoadCatalog(); err == nil {
+		t.Fatal("expected missing spick.res.yaml to ignore plugin manifest fallback")
+	}
+}
+
+func TestParseResourceManifestModelsAgentsAndPluginKinds(t *testing.T) {
+	manifest, err := parseResourceManifest([]byte("version: 1\nkind: plugin\nplugin:\n  id: demo\n  runtime: opencode\n  entry: index.js\nresources:\n  skills:\n    - id: demo\n      path: ./skills/demo\n  agents:\n    - id: review\n      path: ./agents/review.md\n      format: markdown\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Kind != model.ResourceKindPlugin || manifest.Plugin == nil || manifest.Plugin.Runtime != "opencode" || len(manifest.Resources.Agents) != 1 || manifest.Resources.Agents[0].Format != "markdown" {
+		t.Fatalf("unexpected manifest model: %+v", manifest)
 	}
 }
 
@@ -206,10 +223,10 @@ func TestLoadCatalogMissingManifest(t *testing.T) {
 
 func TestLoadCatalogInvalidProjectAgents(t *testing.T) {
 	root := t.TempDir()
-	mustWrite(t, filepath.Join(root, "spick.yaml"), "project:\n  agents:\n    \"\": {skills: []}\n")
+	mustWrite(t, filepath.Join(root, "spick.yaml"), "project:\n  runtimes:\n    \"\": {skills: []}\n")
 	loader := &Loader{Root: root}
 	if _, err := loader.LoadCatalog(); err == nil {
-		t.Fatal("expected invalid project.agents error")
+		t.Fatal("expected invalid project.runtimes error")
 	}
 }
 
@@ -224,7 +241,7 @@ func TestLoadCatalogInvalidProjectExposureMethod(t *testing.T) {
 
 func TestLoadProjectConfigParsesPlugins(t *testing.T) {
 	root := t.TempDir()
-	mustWrite(t, filepath.Join(root, "spick.yaml"), "project:\n  plugins:\n    - id: plugin1\n      source: github:owner/plugin\n      ref: v1\n  agents: {}\n")
+	mustWrite(t, filepath.Join(root, "spick.yaml"), "project:\n  plugins:\n    - id: plugin1\n      source: github:owner/plugin\n      ref: v1\n  runtimes: {}\n")
 	w := New(root)
 	got, err := w.LoadProjectConfig()
 	if err != nil {
@@ -235,6 +252,49 @@ func TestLoadProjectConfigParsesPlugins(t *testing.T) {
 	}
 	if !got.AutoApply {
 		t.Fatal("expected autoApply default true")
+	}
+}
+
+func TestLoadProjectConfigParsesAgents(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "spick.yaml"), "project:\n  agents:\n    - id: opencode\n      source: github:owner/agent\n      path: ./agents/opencode\n      ref: v1\n  runtimes: {}\n")
+	w := New(root)
+	got, err := w.LoadProjectConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got.Agents) != 1 || got.Agents[0].ID != "opencode" || got.Agents[0].Path != "./agents/opencode" {
+		t.Fatalf("unexpected agents: %+v", got.Agents)
+	}
+}
+
+func TestWriteProjectConfigPreservesAgentsAndFields(t *testing.T) {
+	root := t.TempDir()
+	project := model.ProjectConfig{
+		Skills:         []model.ProjectSkill{{ID: "skill1", Source: "github:owner/skill"}},
+		Plugins:        []model.ProjectPlugin{{ID: "plugin1", Source: "github:owner/plugin"}},
+		Agents:         []model.ProjectAgent{{ID: "opencode", Source: "github:owner/agent", Path: "./agents/opencode", Ref: "v1"}},
+		Runtimes:       map[string]model.ProjectRuntimeEnablement{"opencode": {Skills: []string{"skill1"}, Plugins: []string{"plugin1"}}},
+		ExposureMethod: model.ExposureMethodCopy,
+		AutoApply:      false,
+	}
+	w := New(root)
+	if err := w.WriteProjectConfig(project); err != nil {
+		t.Fatal(err)
+	}
+	got, err := w.LoadProjectConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(root, "spick.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "exposureMethod: copy") || !strings.Contains(string(data), "autoApply: false") {
+		t.Fatal("expected preserved fields in output")
+	}
+	if len(got.Agents) != 1 || got.Agents[0].Path != "./agents/opencode" {
+		t.Fatalf("unexpected roundtrip agents: %+v", got.Agents)
 	}
 }
 
@@ -253,7 +313,7 @@ func TestLoadProjectConfigParsesAutoApplyFalse(t *testing.T) {
 
 func TestLoadProjectConfigDefaultsAutoApplyTrue(t *testing.T) {
 	root := t.TempDir()
-	mustWrite(t, filepath.Join(root, "spick.yaml"), "project:\n  agents: {}\n")
+	mustWrite(t, filepath.Join(root, "spick.yaml"), "project:\n  runtimes: {}\n")
 	w := New(root)
 	got, err := w.LoadProjectConfig()
 	if err != nil {
@@ -266,7 +326,7 @@ func TestLoadProjectConfigDefaultsAutoApplyTrue(t *testing.T) {
 
 func TestLoadProjectConfigRejectsPluginWithoutSource(t *testing.T) {
 	root := t.TempDir()
-	mustWrite(t, filepath.Join(root, "spick.yaml"), "project:\n  plugins:\n    - id: plugin1\n      ref: v1\n  agents: {}\n")
+	mustWrite(t, filepath.Join(root, "spick.yaml"), "project:\n  plugins:\n    - id: plugin1\n      ref: v1\n  runtimes: {}\n")
 	w := New(root)
 	if _, err := w.LoadProjectConfig(); err == nil {
 		t.Fatal("expected invalid project.plugins error")
@@ -275,7 +335,7 @@ func TestLoadProjectConfigRejectsPluginWithoutSource(t *testing.T) {
 
 func TestLoadProjectConfigRejectsDuplicateSkillIDs(t *testing.T) {
 	root := t.TempDir()
-	mustWrite(t, filepath.Join(root, "spick.yaml"), "project:\n  skills:\n    - id: skill1\n      source: github:owner/skill\n    - id: skill1\n      source: github:owner/skill\n  agents: {}\n")
+	mustWrite(t, filepath.Join(root, "spick.yaml"), "project:\n  skills:\n    - id: skill1\n      source: github:owner/skill\n    - id: skill1\n      source: github:owner/skill\n  runtimes: {}\n")
 	w := New(root)
 	if _, err := w.LoadProjectConfig(); err == nil {
 		t.Fatal("expected duplicate skill id error")
@@ -284,7 +344,7 @@ func TestLoadProjectConfigRejectsDuplicateSkillIDs(t *testing.T) {
 
 func TestLoadProjectConfigRejectsUndeclaredAgentReference(t *testing.T) {
 	root := t.TempDir()
-	mustWrite(t, filepath.Join(root, "spick.yaml"), "project:\n  skills:\n    - id: skill1\n      source: github:owner/skill\n  agents:\n    opencode:\n      skills:\n        - missing\n")
+	mustWrite(t, filepath.Join(root, "spick.yaml"), "project:\n  skills:\n    - id: skill1\n      source: github:owner/skill\n  runtimes:\n    opencode:\n      skills:\n        - missing\n")
 	w := New(root)
 	if _, err := w.LoadProjectConfig(); err == nil {
 		t.Fatal("expected undeclared reference error")
@@ -293,7 +353,7 @@ func TestLoadProjectConfigRejectsUndeclaredAgentReference(t *testing.T) {
 
 func TestRemoveProjectSkillsCleansDeclarationsAndEnablements(t *testing.T) {
 	root := t.TempDir()
-	mustWrite(t, filepath.Join(root, "spick.yaml"), "project:\n  skills:\n    - id: one\n      source: github:owner/one\n    - id: two\n      source: github:owner/two\n  agents:\n    opencode:\n      skills:\n        - one\n        - two\n")
+	mustWrite(t, filepath.Join(root, "spick.yaml"), "project:\n  skills:\n    - id: one\n      source: github:owner/one\n    - id: two\n      source: github:owner/two\n  runtimes:\n    opencode:\n      skills:\n        - one\n        - two\n")
 	w := New(root)
 	if err := w.RemoveProjectSkills([]string{"one"}); err != nil {
 		t.Fatal(err)
@@ -305,14 +365,14 @@ func TestRemoveProjectSkillsCleansDeclarationsAndEnablements(t *testing.T) {
 	if len(got.Skills) != 1 || got.Skills[0].ID != "two" {
 		t.Fatalf("unexpected skills: %+v", got.Skills)
 	}
-	if len(got.Agents["opencode"].Skills) != 1 || got.Agents["opencode"].Skills[0] != "two" {
-		t.Fatalf("unexpected agent skills: %+v", got.Agents)
+	if len(got.Runtimes["opencode"].Skills) != 1 || got.Runtimes["opencode"].Skills[0] != "two" {
+		t.Fatalf("unexpected runtime skills: %+v", got.Runtimes)
 	}
 }
 
 func TestRemoveProjectPluginsCleansDeclarationsAndEnablements(t *testing.T) {
 	root := t.TempDir()
-	mustWrite(t, filepath.Join(root, "spick.yaml"), "project:\n  plugins:\n    - id: one\n      source: github:owner/one\n    - id: two\n      source: github:owner/two\n  agents:\n    opencode:\n      plugins:\n        - one\n        - two\n")
+	mustWrite(t, filepath.Join(root, "spick.yaml"), "project:\n  plugins:\n    - id: one\n      source: github:owner/one\n    - id: two\n      source: github:owner/two\n  runtimes:\n    opencode:\n      plugins:\n        - one\n        - two\n")
 	w := New(root)
 	if err := w.RemoveProjectPlugins([]string{"one"}); err != nil {
 		t.Fatal(err)
@@ -324,14 +384,14 @@ func TestRemoveProjectPluginsCleansDeclarationsAndEnablements(t *testing.T) {
 	if len(got.Plugins) != 1 || got.Plugins[0].ID != "two" {
 		t.Fatalf("unexpected plugins: %+v", got.Plugins)
 	}
-	if len(got.Agents["opencode"].Plugins) != 1 || got.Agents["opencode"].Plugins[0] != "two" {
-		t.Fatalf("unexpected agent plugins: %+v", got.Agents)
+	if len(got.Runtimes["opencode"].Plugins) != 1 || got.Runtimes["opencode"].Plugins[0] != "two" {
+		t.Fatalf("unexpected runtime plugins: %+v", got.Runtimes)
 	}
 }
 
 func TestLoadCatalogDuplicateID(t *testing.T) {
 	root := t.TempDir()
-	mustWrite(t, filepath.Join(root, "spick.skill.yaml"), "version: 1\nskills:\n    - id: demo\n      path: .\n    - id: demo\n      path: .\n")
+	mustWrite(t, filepath.Join(root, "spick.res.yaml"), "version: 1\nkind: resources\nresources:\n  skills:\n    - id: demo\n      path: .\n    - id: demo\n      path: .\n")
 	mustWrite(t, filepath.Join(root, "SKILL.md"), "# demo\n")
 	loader := &Loader{Root: root}
 	if _, err := loader.LoadCatalog(); err == nil {
@@ -341,7 +401,7 @@ func TestLoadCatalogDuplicateID(t *testing.T) {
 
 func TestLoadCatalogInvalidID(t *testing.T) {
 	root := t.TempDir()
-	mustWrite(t, filepath.Join(root, "spick.skill.yaml"), "version: 1\nskills:\n    - id: Bad\n      path: .\n")
+	mustWrite(t, filepath.Join(root, "spick.res.yaml"), "version: 1\nkind: resources\nresources:\n  skills:\n    - id: Bad\n      path: .\n")
 	mustWrite(t, filepath.Join(root, "SKILL.md"), "# demo\n")
 	loader := &Loader{Root: root}
 	if _, err := loader.LoadCatalog(); err == nil {
@@ -352,7 +412,7 @@ func TestLoadCatalogInvalidID(t *testing.T) {
 func TestLoadCatalogPathEscapeRejected(t *testing.T) {
 	root := t.TempDir()
 	parent := filepath.Dir(root)
-	mustWrite(t, filepath.Join(root, "spick.skill.yaml"), "version: 1\nskills:\n    - id: demo\n      path: ../other\n")
+	mustWrite(t, filepath.Join(root, "spick.res.yaml"), "version: 1\nkind: resources\nresources:\n  skills:\n    - id: demo\n      path: ../other\n")
 	mustWrite(t, filepath.Join(parent, "SKILL.md"), "# other\n")
 	loader := &Loader{Root: root}
 	if _, err := loader.LoadCatalog(); err == nil {
@@ -362,7 +422,7 @@ func TestLoadCatalogPathEscapeRejected(t *testing.T) {
 
 func TestLoadCatalogMissingSkillMD(t *testing.T) {
 	root := t.TempDir()
-	mustWrite(t, filepath.Join(root, "spick.skill.yaml"), "version: 1\nskills:\n    - id: demo\n      path: .\n")
+	mustWrite(t, filepath.Join(root, "spick.res.yaml"), "version: 1\nkind: resources\nresources:\n  skills:\n    - id: demo\n      path: .\n")
 	loader := &Loader{Root: root}
 	if _, err := loader.LoadCatalog(); err == nil {
 		t.Fatal("expected missing SKILL.md error")
@@ -370,12 +430,75 @@ func TestLoadCatalogMissingSkillMD(t *testing.T) {
 }
 
 func TestManifestVersionDefaultsToOne(t *testing.T) {
-	m, err := parseManifest([]byte(strings.TrimSpace("skills:\n    - id: demo\n      path: .\n")))
+	m, err := parseResourceManifest([]byte(strings.TrimSpace("version: 1\nkind: resources\nresources:\n  skills:\n    - id: demo\n      path: .\n")))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if m.Version != 1 {
 		t.Fatalf("expected default version 1, got %d", m.Version)
+	}
+}
+
+func TestWorkspaceWriteAndLoadResourceManifestDefaultsKindFromSkills(t *testing.T) {
+	root := t.TempDir()
+	w := New(root)
+	manifest := model.ResourceManifest{
+		Resources: model.ResourceCollections{
+			Skills: []model.ResourceSkill{{ID: "demo", Path: "."}},
+		},
+	}
+	if err := w.WriteResourceManifest(manifest); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	loaded, err := w.LoadResourceManifest()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if loaded.Version != 1 {
+		t.Fatalf("expected default version 1, got %d", loaded.Version)
+	}
+	if loaded.Kind != model.ResourceKindResources {
+		t.Fatalf("expected inferred kind %q, got %q", model.ResourceKindResources, loaded.Kind)
+	}
+}
+
+func TestWorkspaceWriteAndLoadResourceManifestDefaultsKindFromPlugin(t *testing.T) {
+	root := t.TempDir()
+	w := New(root)
+	manifest := model.ResourceManifest{
+		Plugin: &model.ResourcePlugin{
+			ID:      "demo",
+			Runtime: "opencode",
+			Entry:   "index.js",
+		},
+	}
+	if err := w.WriteResourceManifest(manifest); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	loaded, err := w.LoadResourceManifest()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if loaded.Kind != model.ResourceKindPlugin {
+		t.Fatalf("expected inferred kind %q, got %q", model.ResourceKindPlugin, loaded.Kind)
+	}
+}
+
+func TestWorkspaceWriteAndLoadResourceManifestPreservesExplicitKind(t *testing.T) {
+	root := t.TempDir()
+	w := New(root)
+	manifest := model.ResourceManifest{
+		Kind: model.ResourceKindAgent,
+	}
+	if err := w.WriteResourceManifest(manifest); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	loaded, err := w.LoadResourceManifest()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if loaded.Kind != model.ResourceKindAgent {
+		t.Fatalf("expected explicit kind %q preserved, got %q", model.ResourceKindAgent, loaded.Kind)
 	}
 }
 
@@ -431,7 +554,7 @@ func TestDiscoverCatalogIgnoresNestedSkills(t *testing.T) {
 
 func TestLoadCatalogManifestOverridesDiscovery(t *testing.T) {
 	root := t.TempDir()
-	mustWrite(t, filepath.Join(root, "spick.skill.yaml"), "version: 1\nskills:\n    - id: demo\n      path: .\n")
+	mustWrite(t, filepath.Join(root, "spick.res.yaml"), "version: 1\nkind: resources\nresources:\n  skills:\n    - id: demo\n      path: .\n")
 	mustWrite(t, filepath.Join(root, "SKILL.md"), "# root\n")
 	loader := &Loader{Root: root}
 	got, err := loader.LoadCatalog()

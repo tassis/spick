@@ -7,62 +7,66 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/tassis/spick/internal/app"
 	"github.com/tassis/spick/internal/config"
-	"github.com/tassis/spick/internal/ui"
 )
 
-var rmOpts struct {
-	scope       string
-	skills      []string
-	pruneUnused bool
-}
+var rmOpts struct{ global, skill, plugin, agent, pruneUnused bool }
 
-var rmCmd = &cobra.Command{
-	Use:   "rm",
-	Short: "Remove declared skills and enablement",
-	Args:  cobra.ArbitraryArgs,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		skills := args
-		if len(skills) == 0 {
-			listed, err := appService.List(app.ListOptions{Scope: config.Scope(rmOpts.scope)})
-			if err != nil {
-				return err
-			}
-			if len(listed.Skills) == 0 {
-				_, err = fmt.Fprintln(cmd.OutOrStdout(), "no installed skills")
-				return err
-			}
-			options := make([]ui.Option, 0, len(listed.Skills))
-			for _, sk := range listed.Skills {
-				options = append(options, ui.Option{Label: sk.ID})
-			}
-			picked, err := appService.Prompter.MultiSelect("Remove skills", options, nil)
-			if err != nil {
-				return err
-			}
-			skills = make([]string, 0, len(picked))
-			for _, idx := range picked {
-				if idx >= 0 && idx < len(listed.Skills) {
-					skills = append(skills, listed.Skills[idx].ID)
-				}
-			}
-		}
-		result, err := appService.Remove(app.RemoveOptions{Scope: config.Scope(rmOpts.scope), Skills: skills, PruneUnused: rmOpts.pruneUnused})
-		if err != nil {
+var rmCmd = &cobra.Command{Use: "rm", Short: "Manage removals", Long: "Manage removals from a single root-level surface. Use --skill, --plugin, or --agent to narrow selection.", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
+	scope := config.ScopeProject
+	if rmOpts.global {
+		scope = config.ScopeGlobal
+	}
+	if result, err := ensureProjectInitPreflight(cmd, scope); err != nil {
+		return err
+	} else if result.stop {
+		return nil
+	}
+	mode := ""
+	switch {
+	case rmOpts.skill:
+		mode = "skill"
+	case rmOpts.plugin:
+		mode = "plugin"
+	case rmOpts.agent:
+		return fmt.Errorf("no valid agent resource found")
+	}
+	selectedMode := app.RemoveSelectionModeAuto
+	if mode == "skill" {
+		selectedMode = app.RemoveSelectionModeSkill
+	}
+	if mode == "plugin" {
+		selectedMode = app.RemoveSelectionModePlugin
+	}
+	selected, err := appService.SelectRemovals(app.RemoveSelectionOptions{Scope: scope, Mode: selectedMode})
+	if err != nil {
+		return err
+	}
+	selectedSkills := selected.Skills
+	selectedPlugins := selected.Plugins
+	if len(selectedSkills) > 0 {
+		if _, err := appService.Remove(app.RemoveOptions{Scope: scope, Skills: selectedSkills, PruneUnused: rmOpts.pruneUnused}); err != nil {
 			return err
 		}
-		msg := strings.Join(result.Removed, ", ")
-		if result.Message != "" {
-			msg = result.Message + ": " + msg
+	}
+	if len(selectedPlugins) > 0 {
+		if _, err := appService.RemovePlugin(app.RemovePluginOptions{Scope: scope, IDs: selectedPlugins}); err != nil {
+			return err
 		}
-		if rmOpts.pruneUnused {
-			msg = "pruned-unused: " + msg
-		}
-		_, err = fmt.Fprintf(cmd.OutOrStdout(), "removed fully: %s\n", msg)
-		return err
-	},
-}
+	}
+	removed := append([]string{}, selectedSkills...)
+	removed = append(removed, selectedPlugins...)
+	if len(removed) == 0 {
+		return nil
+	}
+	_, err = fmt.Fprintf(cmd.OutOrStdout(), "removed fully: %s\n", strings.Join(removed, ", "))
+	return err
+}}
 
 func init() {
-	rmCmd.Flags().StringVar(&rmOpts.scope, "scope", string(config.ScopeProject), "scope to operate in")
+	rmCmd.Flags().BoolVarP(&rmOpts.global, "global", "g", false, "use global mode")
+	rmCmd.Flags().BoolVar(&rmOpts.skill, "skill", false, "narrow to skills")
+	rmCmd.Flags().BoolVar(&rmOpts.plugin, "plugin", false, "narrow to plugins")
+	rmCmd.Flags().BoolVar(&rmOpts.agent, "agent", false, "narrow to agents")
 	rmCmd.Flags().BoolVar(&rmOpts.pruneUnused, "prune-unused", false, "prune unused skills")
+	rmCmd.MarkFlagsMutuallyExclusive("skill", "plugin", "agent")
 }
