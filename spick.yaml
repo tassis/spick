@@ -1,0 +1,12 @@
+version: 1
+project:
+    skills:
+        - id: careful-implementation
+          source: github:tassis/grimoire
+          path: ""
+          ref: ""
+    plugins: []
+    agents: []
+    runtimes: {}
+    exposureMethod: symlink
+    autoApply: true
